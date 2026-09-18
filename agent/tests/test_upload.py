@@ -59,6 +59,126 @@ def test_sniff_png_dimensions():
     assert dims == (1, 1)
 
 
+# ── video upload ─────────────────────────────────────────────────────────
+
+
+def _mp4_bytes() -> bytes:
+    """Tiny fake MP4: size(4) + 'ftyp' + major brand 'isom' + minor + compat."""
+    box = b"\x00\x00\x00\x18" + b"ftyp" + b"isom" + b"\x00\x00\x02\x00" + b"isomiso2"
+    return box + b"\x00" * 32
+
+
+def _mov_bytes() -> bytes:
+    """QuickTime: same ftyp layout but major brand 'qt  '."""
+    return b"\x00\x00\x00\x18" + b"ftyp" + b"qt  " + b"\x00\x00\x02\x00" + b"qt  "
+
+def _webm_bytes() -> bytes:
+    """EBML doc-id 0x1A45DFA3 prefix (WebM)."""
+    return b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01" + b"\x00" * 16
+
+
+def test_sniff_video_mime():
+    from flowboard.routes.upload import _sniff_video_mime
+    assert _sniff_video_mime(_mp4_bytes()) == "video/mp4"
+    assert _sniff_video_mime(_mov_bytes()) == "video/quicktime"
+    assert _sniff_video_mime(_webm_bytes()) == "video/webm"
+    assert _sniff_video_mime(b"not a video at all, sorry") is None
+    assert _sniff_video_mime(b"") is None
+
+
+def test_upload_video_happy_path(client, monkeypatch):
+    """Stub the SDK upload; verify we classify kind=video + cache bytes."""
+    media_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    payload = _mp4_bytes()
+
+    async def stub_upload(self, video_bytes, mime_type, project_id, file_name):
+        assert isinstance(video_bytes, bytes) and video_bytes
+        assert mime_type == "video/mp4"
+        assert project_id == "abcd1234"
+        assert file_name == "ref.mp4"
+        return {"raw": {"data": {"media": {"name": media_uuid}}}, "media_id": media_uuid}
+
+    monkeypatch.setattr(flow_sdk_module.FlowSDK, "upload_video", stub_upload)
+    monkeypatch.setattr(flow_sdk_module, "_sdk", None)
+
+    r = client.post(
+        "/api/upload",
+        data={"project_id": "abcd1234"},
+        files={"file": ("ref.mp4", payload, "video/mp4")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["media_id"] == media_uuid
+    assert body["mime"] == "video/mp4"
+    assert body["size"] == len(payload)
+    assert body["kind"] == "video"
+    # Video uploads must NOT emit image-only fields.
+    assert "aspect_ratio" not in body
+
+    cached = media_service.cached_path(media_uuid)
+    assert cached is not None and cached.exists()
+    assert cached.suffix == ".mp4"
+    assert Path(cached).read_bytes() == payload
+
+    status = media_service.status(media_uuid)
+    assert status["available"] is True
+    assert status.get("mime") == "video/mp4"
+
+
+def test_upload_video_declared_quicktime_sniffs_to_mov(client, monkeypatch):
+    """Content-Type video/quicktime with qt-brand bytes → .mov cache."""
+    media_uuid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+    payload = _mov_bytes()
+
+    async def stub_upload(self, video_bytes, mime_type, project_id, file_name):
+        assert isinstance(video_bytes, bytes) and video_bytes
+        assert mime_type == "video/quicktime"
+        return {"raw": {}, "media_id": media_uuid}
+
+    monkeypatch.setattr(flow_sdk_module.FlowSDK, "upload_video", stub_upload)
+    monkeypatch.setattr(flow_sdk_module, "_sdk", None)
+
+    r = client.post(
+        "/api/upload",
+        data={"project_id": "abcd1234"},
+        files={"file": ("clip.mov", payload, "video/quicktime")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["mime"] == "video/quicktime"
+    assert r.json()["kind"] == "video"
+    cached = media_service.cached_path(media_uuid)
+    assert cached is not None and cached.suffix == ".mov"
+
+
+def test_upload_video_rejects_fake_container(client, monkeypatch):
+    """Declared video/mp4 but the bytes are not a video container → 415."""
+    async def stub_upload(self, **kwargs):
+        raise AssertionError("must not reach the SDK with unverifiable bytes")
+
+    monkeypatch.setattr(flow_sdk_module.FlowSDK, "upload_image", stub_upload)
+    monkeypatch.setattr(flow_sdk_module, "_sdk", None)
+
+    r = client.post(
+        "/api/upload",
+        data={"project_id": "abcd1234"},
+        files={"file": ("fake.mp4", b"this is definitely not a video", "video/mp4")},
+    )
+    assert r.status_code == 415, r.text
+
+
+def test_upload_video_oversize(client, monkeypatch):
+    from flowboard.routes import upload as upload_route
+
+    monkeypatch.setattr(upload_route, "MAX_VIDEO_UPLOAD_BYTES", 64)
+    payload = _mp4_bytes() + b"x" * 128  # over the patched video cap
+    r = client.post(
+        "/api/upload",
+        data={"project_id": "abcd1234"},
+        files={"file": ("big.mp4", payload, "video/mp4")},
+    )
+    assert r.status_code == 413, r.text
+
+
 def test_upload_rejects_non_image_mime(client):
     r = client.post(
         "/api/upload",

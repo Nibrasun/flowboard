@@ -17,6 +17,13 @@ NodeType = Literal[
     "prompt",
     "note",
     "visual_asset",
+    # Video reference — a standalone node holding an uploaded clip that
+    # supplies the MOTION for a downstream Video node's v2v (motion
+    # transfer / abra_edit) generation. Storage-wise it's identical to
+    # visual_asset (one Asset row keyed by data.mediaId); only the
+    # frontend treats it differently (uploads via upload_video, wires
+    # into reference_video_media_id instead of an appearance ref).
+    "video_reference",
     # Storyboard = thin image-node wrapper. Backend treats it the same as
     # `image` for storage / dispatch — see frontend/src/lib/storyboardPrompt.ts
     # for the template that drives gen_image.

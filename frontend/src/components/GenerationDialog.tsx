@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useGenerationStore } from "../store/generation";
-import { useBoardStore, type StoryboardGrid } from "../store/board";
+import { useBoardStore, TYPE_TITLE, type StoryboardGrid } from "../store/board";
 import {
   STORYBOARD_GRIDS,
   buildStoryboardPrompt,
@@ -8,6 +8,7 @@ import {
   normaliseStoryboardGrid,
   totalPanels,
 } from "../lib/storyboardPrompt";
+import { buildVideoReferencePrompt } from "../lib/videoReferencePrompt";
 import {
   useSettingsStore,
   OMNI_FLASH_CREDIT_COST,
@@ -21,6 +22,7 @@ import {
   mediaUrl,
   patchEdge,
   patchNode,
+  uploadVideo,
 } from "../api/client";
 import {
   CHARACTER_GENDERS,
@@ -243,6 +245,15 @@ export function GenerationDialog() {
   // click outside (handled inline) → close.
   const [openVariantPicker, setOpenVariantPicker] = useState<string | null>(null);
 
+  // Reference video (v2v motion source) — the uploaded clip whose motion
+  // drives the video-to-video edit. Persisted on the node as
+  // data.referenceVideoMediaId so it survives dialog close / board reload.
+  const [referenceVideoMediaId, setReferenceVideoMediaId] = useState<string | null>(null);
+  const [referenceVideoName, setReferenceVideoName] = useState<string | null>(null);
+  const [refVideoUploading, setRefVideoUploading] = useState(false);
+  const [refVideoError, setRefVideoError] = useState<string | null>(null);
+  const refVideoInputRef = useRef<HTMLInputElement>(null);
+
   const dialogRef = useRef<HTMLDivElement>(null);
   const firstFocusRef = useRef<HTMLTextAreaElement>(null);
   const triggerRef = useRef<Element | null>(null);
@@ -268,7 +279,12 @@ export function GenerationDialog() {
   // gating as the SettingsPanel.
   const paygateTier = useGenerationStore((s) => s.paygateTier);
 
-  const targetType = node?.data.type ?? "image";
+  const rawTargetType = node?.data.type ?? "image";
+  // VR nodes generate through the standard video pipeline — a VR clip IS
+  // a video; the dialog collects motion prompt + source image the same way.
+  // `isVR` only tweaks labels so the dialog reads as VR, not Video.
+  const targetType = rawTargetType === "video_reference" ? "video" : rawTargetType;
+  const isVR = rawTargetType === "video_reference";
   const isVideo = targetType === "video";
   const isCharacter = targetType === "character";
   const isStoryboard = targetType === "Storyboard";
@@ -285,9 +301,41 @@ export function GenerationDialog() {
   // Find upstream source image for video nodes. When the upstream has
   // multiple variants, we batch-i2v one video per variant — `sourceMediaIds`
   // captures the full set; `sourceMediaId` is the active variant for the
-  // legacy single-source path.
-  const sourceEdge = isVideo ? edges.find((e) => e.target === rfId) : undefined;
+  // legacy single-source path. Excludes video_reference sources — a video
+  // node can have TWO upstream edges (appearance image + motion clip) and
+  // this lookup is for the appearance side only.
+  const sourceEdge = isVideo
+    ? edges.find(
+        (e) =>
+          e.target === rfId &&
+          nodes.find((n) => n.id === e.source)?.data.type !== "video_reference",
+      )
+    : undefined;
   const sourceNode = sourceEdge ? nodes.find((n) => n.id === sourceEdge.source) : undefined;
+
+  // Upstream video_reference node, if wired in — its mediaId becomes the
+  // v2v motion source automatically, taking priority over the manual
+  // in-dialog upload below (connecting a node is the more deliberate act).
+  const videoRefEdge = isVideo
+    ? edges.find(
+        (e) => e.target === rfId && nodes.find((n) => n.id === e.source)?.data.type === "video_reference",
+      )
+    : undefined;
+  const videoRefNode = videoRefEdge ? nodes.find((n) => n.id === videoRefEdge.source) : undefined;
+  const connectedVideoRefMediaId =
+    typeof videoRefNode?.data.mediaId === "string" ? videoRefNode.data.mediaId : null;
+  const connectedVideoRefUrl =
+    typeof videoRefNode?.data.referenceVideoUrl === "string"
+      ? videoRefNode.data.referenceVideoUrl
+      : null;
+  // True once a motion source is wired up (connected VR node or inline
+  // upload) — switches the appearance-source UI from the single-node
+  // variant picker (Veo i2v's normal shape) to the multi-node ingredient
+  // chip list, since v2v accepts several distinct appearance refs
+  // (e.g. a character node + a separate close-up face node).
+  const hasReferenceVideo =
+    !!connectedVideoRefMediaId || !!connectedVideoRefUrl || !!referenceVideoMediaId;
+  const showRefChips = !isVideo || isOmniVideo || (isVideo && hasReferenceVideo);
 
   // Storyboard → video: when ANY upstream node is a Storyboard composite,
   // the motion prompt MUST follow a fixed template that asks Flow to
@@ -334,7 +382,7 @@ export function GenerationDialog() {
   // Both image targets AND Omni-video targets use the ingredient chip
   // list (multi-ref upstream → one chip per edge). Veo i2v video has
   // its own single-source-with-variant-batch picker below.
-  const promptSourceNodes = (!isVideo || isOmniVideo) && rfId
+  const promptSourceNodes = showRefChips && rfId
     ? edges
         .filter((e) => e.target === rfId)
         .map((e) => {
@@ -346,7 +394,7 @@ export function GenerationDialog() {
         .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
     : [];
 
-  const refSourceNodes = (!isVideo || isOmniVideo) && rfId
+  const refSourceNodes = showRefChips && rfId
     ? edges
         .filter((e) => e.target === rfId)
         .map((e) => {
@@ -393,18 +441,53 @@ export function GenerationDialog() {
       // with the locked motion template.
       let initialPrompt = openDialog.prompt;
       const openNode = nodes.find((n) => n.id === rfId);
-      const openNodeType = openNode?.data.type ?? "image";
+      const openNodeType = (openNode?.data.type ?? "image") === "video_reference" ? "video" : (openNode?.data.type ?? "image");
       if (openNodeType === "video") {
-        const sb = useBoardStore
-          .getState()
-          .edges.filter((e) => e.target === rfId)
-          .map((e) =>
-            useBoardStore.getState().nodes.find((n) => n.id === e.source),
-          )
-          .find((n) => n?.data.type === "Storyboard");
+        const boardState = useBoardStore.getState();
+        const upstream = boardState.edges
+          .filter((e) => e.target === rfId)
+          .map((e) => boardState.nodes.find((n) => n.id === e.source))
+          .filter((n): n is NonNullable<typeof n> => !!n);
+        const sb = upstream.find((n) => n.data.type === "Storyboard");
         if (sb) {
           const g = normaliseStoryboardGrid(sb.data.storyboardGrid);
           initialPrompt = buildStoryboardVideoPrompt(g);
+        } else {
+          // v2v (motion transfer): a reference video wired in via a
+          // "VR" node OR already uploaded inline on this node locks the
+          // motion-transfer template, mirroring the storyboard case above.
+          const vrNode = upstream.find((n) => n.data.type === "video_reference");
+          const hasRefVideo =
+            typeof vrNode?.data.mediaId === "string" && vrNode.data.mediaId
+              ? true
+              : typeof boardState.nodes.find((n) => n.id === rfId)?.data
+                    .referenceVideoMediaId === "string";
+          if (hasRefVideo) {
+            // Every OTHER upstream node earns an @-mention in the locked
+            // template — not just the media-bearing REF_SOURCE_TYPES.
+            // A Prompt/Note node has no image to feed the actual v2v
+            // dispatch (that still only pulls media from `refSourceNodes`
+            // below, which stays restricted to real appearance images —
+            // sending a Prompt/Note/video mediaId as an appearance ref
+            // would just break the API call), but it's still valid
+            // CONTEXT the user wants named in the motion-transfer prompt
+            // text itself (e.g. "@wardrobe-notes" pointing at a Note).
+            // video_reference is excluded — that's "the reference video"
+            // itself, already named generically in the template.
+            const refMentions = upstream
+              .filter((n) => n.data.type !== "video_reference")
+              .map((n) => {
+                const t = typeof n.data.title === "string" ? n.data.title.trim() : "";
+                // A node still sitting on its generic default ("Image",
+                // "Character", …) hasn't been deliberately named — an
+                // "@Image" mention reads as noise, not a real reference.
+                // Only a title the user actually customised earns an
+                // @-mention; otherwise fall back to the plain shortId tag.
+                const isDefaultTitle = !t || t === TYPE_TITLE[n.data.type as keyof typeof TYPE_TITLE];
+                return isDefaultTitle ? `#${n.data.shortId}` : `@${t}`;
+              });
+            initialPrompt = buildVideoReferencePrompt(refMentions);
+          }
         }
       }
       setPrompt(initialPrompt);
@@ -446,10 +529,17 @@ export function GenerationDialog() {
       setAutoBuilding(false);
       setAutoPromptUsed(false);
       // Default-select every upstream source variant for video targets so
-      // the user just hits Generate when they want all videos.
+      // the user just hits Generate when they want all videos. Skip
+      // video_reference sources — that edge feeds the motion clip, not
+      // the appearance variants this selector is for.
       const upstreamEdge = useBoardStore
         .getState()
-        .edges.find((e) => e.target === rfId);
+        .edges.find(
+          (e) =>
+            e.target === rfId &&
+            useBoardStore.getState().nodes.find((n) => n.id === e.source)?.data.type !==
+              "video_reference",
+        );
       const upstreamNode = upstreamEdge
         ? useBoardStore.getState().nodes.find((n) => n.id === upstreamEdge.source)
         : undefined;
@@ -457,6 +547,19 @@ export function GenerationDialog() {
         upstreamNode?.data.mediaIds ??
         (upstreamNode?.data.mediaId ? [upstreamNode.data.mediaId] : []);
       setSelectedSourceIdx(new Set(ups.map((_, i) => i)));
+      // Hydrate the persisted reference video (v2v motion source) so a
+      // reopened dialog shows the clip the node already has.
+      const refVid =
+        typeof openNodeData?.referenceVideoMediaId === "string"
+          ? openNodeData.referenceVideoMediaId
+          : null;
+      setReferenceVideoMediaId(refVid);
+      setReferenceVideoName(
+        typeof openNodeData?.referenceVideoName === "string"
+          ? openNodeData.referenceVideoName
+          : null,
+      );
+      setRefVideoError(null);
       triggerRef.current = document.activeElement;
       // Focus textarea on open
       setTimeout(() => firstFocusRef.current?.focus(), 50);
@@ -564,6 +667,70 @@ export function GenerationDialog() {
     }
   }
 
+  /** Upload a reference video (v2v motion source) into the board's Flow
+   *  project and persist its media_id on the target node. */
+  async function uploadReferenceVideo(file: File) {
+    if (!rfId) return;
+    setRefVideoError(null);
+    setRefVideoUploading(true);
+    try {
+      const projectId = await useGenerationStore.getState().ensureProjectId();
+      if (!projectId) {
+        setRefVideoError("no project — open a board first");
+        return;
+      }
+      const dbId = parseInt(rfId, 10);
+      const resp = await uploadVideo(
+        file,
+        projectId,
+        isNaN(dbId) ? undefined : dbId,
+      );
+      setReferenceVideoMediaId(resp.media_id);
+      setReferenceVideoName(file.name);
+      // Persist on the node so the clip survives dialog close / reload.
+      useBoardStore.getState().updateNodeData(rfId, {
+        referenceVideoMediaId: resp.media_id,
+        referenceVideoName: file.name,
+      });
+      if (!isNaN(dbId)) {
+        patchNode(dbId, {
+          data: {
+            referenceVideoMediaId: resp.media_id,
+            referenceVideoName: file.name,
+          },
+        }).catch(() => {});
+      }
+    } catch (err) {
+      setRefVideoError(
+        err instanceof Error ? err.message : "video upload failed",
+      );
+    } finally {
+      setRefVideoUploading(false);
+    }
+  }
+
+  /** Detach the reference video from the node (local store + backend). */
+  function clearReferenceVideo() {
+    if (!rfId) return;
+    setReferenceVideoMediaId(null);
+    setReferenceVideoName(null);
+    const dbId = parseInt(rfId, 10);
+    // `undefined` clears in the local store merge; `null` is the
+    // backend's explicit delete sentinel.
+    useBoardStore.getState().updateNodeData(rfId, {
+      referenceVideoMediaId: undefined,
+      referenceVideoName: undefined,
+    });
+    if (!isNaN(dbId)) {
+      patchNode(dbId, {
+        data: {
+          referenceVideoMediaId: null,
+          referenceVideoName: null,
+        },
+      }).catch(() => {});
+    }
+  }
+
   async function handleSubmit() {
     if (!rfId) return;
     // Defense in depth — block submit if the LLM layer is still composing
@@ -633,7 +800,7 @@ export function GenerationDialog() {
     if (isCharacter) {
       const built = buildCharacterPrompt(charGender, charCountry, charVibe, charExtras);
       // Stamp the picker selections directly onto the node so the detail
-      // panel can show "Country: Nhật Bản · Vibe: Douyin" later. These
+      // panel can show "Country: Jepang · Vibe: Douyin" later. These
       // choices don't round-trip through the backend params (they're
       // baked into the prompt text), so we persist them here at dispatch
       // time. patchNode merges, so this fires alongside the generation
@@ -708,24 +875,40 @@ export function GenerationDialog() {
       // we have (manual or auto-synthesised). Putting it last makes it
       // the dominant instruction the model resolves against — overrides
       // any conflicting "slow dolly-in" the synthesizer might have output.
-      const camInstruction = cameraInstruction(camera);
+      // Skip entirely for v2v (reference video) — the locked template
+      // already says "do not add/invent actions not in the reference
+      // video", so appending a camera move fights its own instruction.
+      const camInstruction = hasReferenceVideo ? "" : cameraInstruction(camera);
       const videoPrompt = camInstruction
         ? `${finalPrompt}. ${camInstruction}`
         : finalPrompt;
-      // Filter the upstream variants to the user's selection — the dialog
-      // shows one toggleable thumbnail per variant + an All/None action.
-      const picked = sourceMediaIds.filter((_, i) => selectedSourceIdx.has(i));
-      const useMulti = picked.length > 1;
+      // v2v (reference video present): source images come from EVERY
+      // wired-up appearance ref node (character + optional close-up face
+      // node, etc.), not the single-node variant picker — mirrors Omni
+      // Flash's ingredient list. Otherwise, filter the upstream variants
+      // to the user's selection from the toggleable thumbnail picker.
+      const picked = hasReferenceVideo
+        ? refSourceNodes.map((r) => r.mediaId)
+        : sourceMediaIds.filter((_, i) => selectedSourceIdx.has(i));
+      const useMulti = hasReferenceVideo ? true : picked.length > 1;
       dispatchGeneration(rfId, {
         prompt: videoPrompt,
         aspectRatio,
         kind: "video",
         sourceMediaId: useMulti ? undefined : picked[0],
         sourceMediaIds: useMulti ? picked : undefined,
+        // Reference video (v2v motion source) — a connected "VR"
+        // node wins over the inline dialog upload. Forwarded
+        // to the backend as reference_video_media_id / reference_video_url
+        // (link-only: fetched in-memory at Generate, never stored locally).
+        referenceVideoMediaId: connectedVideoRefMediaId ?? referenceVideoMediaId ?? undefined,
+        referenceVideoUrl: connectedVideoRefUrl ?? undefined,
         // Tell the node UI how many video tiles to reserve while pending —
         // otherwise it defaults to 1 placeholder even though we're
-        // dispatching N i2v ops.
-        variantCount: picked.length,
+        // dispatching N i2v ops. v2v is always a single agent-dispatched
+        // job (one output video) no matter how many appearance refs feed
+        // it, unlike Veo's one-job-per-source-variant batch.
+        variantCount: hasReferenceVideo ? 1 : picked.length,
       });
     } else {
       dispatchGeneration(rfId, {
@@ -749,12 +932,14 @@ export function GenerationDialog() {
   const isWorking = autoBuilding || nodeLLMBusy;
 
   // Both image and video allow empty prompt — we'll auto-synth on submit.
-  // Veo i2v needs at least one selected source variant; Omni Flash
-  // needs at least one ingredient (any upstream image-bearing node).
-  // Other targets just need the LLM not be busy.
+  // Veo i2v needs at least one selected source variant; Omni Flash and v2v
+  // (reference video present) need at least one ingredient (any upstream
+  // image-bearing node). Other targets just need the LLM not be busy.
   const canGenerate = isCharacter
     ? charGender !== null || charCountry !== null || charExtras.trim().length > 0
     : isOmniVideo
+    ? refSourceNodes.length > 0 && !isWorking
+    : isVideo && hasReferenceVideo
     ? refSourceNodes.length > 0 && !isWorking
     : isVideo
     ? selectedSourceIdx.size > 0 && !isWorking
@@ -779,7 +964,9 @@ export function GenerationDialog() {
         <div className="gen-dialog__header">
           <div>
             <h2 id="gen-dialog-title" className="gen-dialog__title">
-              {isVideo
+              {isVR
+                ? "Generate VR clip"
+                : isVideo
                 ? "Generate video"
                 : isCharacter
                 ? "Generate character"
@@ -829,10 +1016,10 @@ export function GenerationDialog() {
               }}
               placeholder={
                 isVideo
-                  ? "Bỏ trống để tự sinh motion prompt từ source image ✨"
+                  ? "Kosongkan untuk auto-generate motion prompt dari source image ✨"
                   : isPrompt
-                  ? "Nhập prompt mồi để feed cho downstream image / video…"
-                  : "Bỏ trống để tự generate prompt từ upstream nodes ✨"
+                  ? "Masukkan prompt awal untuk downstream image / video…"
+                  : "Kosongkan untuk auto-generate prompt dari upstream nodes ✨"
               }
               disabled={isWorking}
               readOnly={hasStoryboardUpstream}
@@ -854,8 +1041,8 @@ export function GenerationDialog() {
             {isWorking && (
               <p className="gen-dialog__hint">
                 {node?.data.aiBriefStatus === "pending"
-                  ? "✨ Đang phân tích image…"
-                  : "✨ Đang dựng prompt từ upstream context…"}
+                  ? "✨ Sedang menganalisis image…"
+                  : "✨ Sedang menyusun prompt dari upstream context…"}
               </p>
             )}
           </div>
@@ -881,7 +1068,7 @@ export function GenerationDialog() {
             </div>
 
             <div className="gen-dialog__field">
-              <span className="gen-dialog__label">Quốc gia</span>
+              <span className="gen-dialog__label">Negara</span>
               <div className="aspect-chip-row">
                 {CHARACTER_COUNTRIES.map((c) => (
                   <button
@@ -915,8 +1102,8 @@ export function GenerationDialog() {
             <div className="gen-dialog__field">
               <div className="gen-dialog__label-row">
                 <label className="gen-dialog__label" htmlFor="gen-char-extras">
-                  Mô tả thêm (tuỳ chọn)
-                  <InfoTip tip="Prompt được auto-build: portrait headshot · vibe styling · photorealistic — tối ưu cho character reference." />
+                  Deskripsi tambahan (opsional)
+                  <InfoTip tip="Prompt dibuat otomatis: portrait headshot · vibe styling · photorealistic — optimal untuk character reference." />
                 </label>
                 <span className="gen-dialog__char-count">{charExtras.length}/200</span>
               </div>
@@ -928,16 +1115,18 @@ export function GenerationDialog() {
                 maxLength={200}
                 value={charExtras}
                 onChange={(e) => setCharExtras(e.target.value)}
-                placeholder="Tuổi, kiểu tóc, trang phục, biểu cảm…"
+                placeholder="Umur, gaya rambut, pakaian, ekspresi…"
               />
             </div>
           </>
         )}
 
-        {/* Source image — Veo i2v ONLY. Omni Flash uses the ingredient
-            chip list (`refSourceNodes`) above, same shape as image
-            targets. */}
-        {isVideo && !isOmniVideo && (
+        {/* Source image — Veo i2v ONLY. Omni Flash AND v2v (reference
+            video present) use the ingredient chip list (`refSourceNodes`)
+            above instead — v2v accepts several distinct appearance refs
+            (e.g. character + a separate close-up face node), which the
+            single-node variant picker below can't express. */}
+        {isVideo && !isOmniVideo && !hasReferenceVideo && (
           <div className="gen-dialog__field">
             <div className="gen-dialog__label-row">
               <span className="gen-dialog__label">
@@ -1005,15 +1194,15 @@ export function GenerationDialog() {
                 <p className="gen-dialog__hint">
                   {selectedSourceIdx.size === 0 ? (
                     <span style={{ color: "#ef4444" }}>
-                      Chọn ít nhất 1 variant để gen video.
+                      Pilih minimal 1 variant untuk gen video.
                     </span>
                   ) : (
                     <>
-                      Sẽ gen <strong>{selectedSourceIdx.size} video</strong>
+                      Akan gen <strong>{selectedSourceIdx.size} video</strong>
                       {selectedSourceIdx.size === sourceMediaIds.length
-                        ? " (tất cả variants)"
+                        ? " (semua variants)"
                         : ` (${selectedSourceIdx.size}/${sourceMediaIds.length} variants)`}
-                      — cùng prompt + camera setting.
+                      — dengan prompt + camera setting yang sama.
                     </>
                   )}
                 </p>
@@ -1026,11 +1215,108 @@ export function GenerationDialog() {
           </div>
         )}
 
+        {/* Reference video — v2v motion source. Video targets only. The
+            clip supplies the MOTION for a video-to-video edit; the
+            upstream image(s) supply the appearance. Two ways in: wire a
+            "VR" node upstream (preferred — visible on the
+            board, reusable across nodes), or upload inline below as a
+            quick one-off. A connected node always wins. */}
+        {isVideo && (
+          <div className="gen-dialog__field">
+            <div className="gen-dialog__label-row">
+              <span className="gen-dialog__label">
+                Video referensi (motion source)
+                <InfoTip tip="Sumber GERAKAN untuk video-to-video (motion transfer / abra_edit): penampilan diambil dari source image, gerakan dari klip ini. Sambungkan node 'VR' ke node ini, atau unggah langsung di sini." />
+              </span>
+            </div>
+            {isOmniVideo && hasReferenceVideo && (
+              <p className="gen-dialog__hint">
+                Omni Flash dipilih di Settings, tapi generate ini otomatis
+                jalan lewat Veo v2v — Omni Flash tidak dukung motion
+                transfer sama sekali.
+              </p>
+            )}
+            {connectedVideoRefMediaId || connectedVideoRefUrl ? (
+              <div className="ref-video">
+                <video
+                  className="ref-video__preview"
+                  src={connectedVideoRefMediaId ? mediaUrl(connectedVideoRefMediaId) : (connectedVideoRefUrl ?? "")}
+                  controls
+                  muted
+                  preload="metadata"
+                />
+                <div className="ref-video__meta">
+                  <span className="ref-video__name">
+                    ❏ Terhubung dari node #{videoRefNode?.data.shortId}
+                    {connectedVideoRefUrl && !connectedVideoRefMediaId ? " (link — tanpa unduh)" : ""}
+                  </span>
+                </div>
+              </div>
+            ) : referenceVideoMediaId ? (
+              <div className="ref-video">
+                <video
+                  className="ref-video__preview"
+                  src={mediaUrl(referenceVideoMediaId)}
+                  controls
+                  muted
+                  preload="metadata"
+                />
+                <div className="ref-video__meta">
+                  <span
+                    className="ref-video__name"
+                    title={referenceVideoName ?? "VR"}
+                  >
+                    ❏ {referenceVideoName ?? "VR"}
+                  </span>
+                  <button
+                    type="button"
+                    className="ref-video__remove"
+                    onClick={clearReferenceVideo}
+                    aria-label="Remove reference video"
+                    title="Remove reference video"
+                  >
+                    ✕ Remove
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="ref-video-drop"
+                  onClick={() => refVideoInputRef.current?.click()}
+                  disabled={refVideoUploading}
+                >
+                  {refVideoUploading ? "Uploading…" : "⬆ Upload video referensi"}
+                </button>
+                <p className="gen-dialog__hint">
+                  mp4 / webm / mov · max 200 MB — gerakan klip ini dipakai
+                  untuk motion transfer ke source image
+                </p>
+              </>
+            )}
+            {refVideoError && (
+              <p className="gen-dialog__hint ref-video__error">{refVideoError}</p>
+            )}
+            <input
+              ref={refVideoInputRef}
+              type="file"
+              accept="video/mp4,video/webm,video/quicktime"
+              hidden
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void uploadReferenceVideo(f);
+                e.target.value = "";
+              }}
+            />
+          </div>
+        )}
+
         {/* Source references — image refs (character/image/visual_asset/
             Storyboard) AND prompt-text refs. Prompt nodes don't have
             media but their text feeds the auto-prompt synth, so we
             surface them as text chips next to the thumbnails. */}
-        {(!isVideo || isOmniVideo)
+        {showRefChips
           && (refSourceNodes.length > 0 || promptSourceNodes.length > 0)
           && (
           <div className="gen-dialog__field">
@@ -1200,7 +1486,7 @@ export function GenerationDialog() {
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
               Model
-              <InfoTip tip="Sticky — selection được lưu cho các lần dispatch sau (đồng bộ với Settings). Veo dùng i2v (1 source image); Omni Flash dùng reference ingredients (đa ảnh) với duration 4/6/8/10s chọn ở dưới." />
+              <InfoTip tip="Sticky — pilihan tersimpan untuk dispatch berikutnya (sinkron dengan Settings). Veo memakai i2v (1 source image); Omni Flash memakai reference ingredients (multi-gambar) dengan duration 4/6/8/10s, pilih di bawah." />
             </span>
             <select
               className="gen-dialog__select"
@@ -1245,12 +1531,12 @@ export function GenerationDialog() {
           </div>
         )}
 
-        {/* Camera movement (video only) */}
-        {isVideo && (
+        {/* Camera movement (video only, not v2v — motion comes from the reference video) */}
+        {isVideo && !hasReferenceVideo && (
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
               Camera
-              <InfoTip tip="Static = locked-off, không zoom/pan — phù hợp e-commerce product shot. Dynamic = để auto-prompt tự quyết camera move (dolly / micro-shift / …)." />
+              <InfoTip tip="Static = locked-off, tanpa zoom/pan — cocok untuk product shot e-commerce. Dynamic = biarkan auto-prompt menentukan camera move (dolly / micro-shift / …)." />
             </span>
             <div className="aspect-chip-row">
               {CAMERA_MOVEMENTS.map((c) => (
@@ -1306,7 +1592,7 @@ export function GenerationDialog() {
           <div className="gen-dialog__field">
             <span className="gen-dialog__label">
               Grid
-              <InfoTip tip="Storyboard renders as a SINGLE composite image — Flow draws the whole grid as one picture. The topic field above is your story (e.g. Rùa và Thỏ); the locked template wraps it for you. For 2×3 / 2×4 the rows × cols flip with the aspect ratio so panels stay readable on both landscape and portrait composites." />
+              <InfoTip tip="Storyboard renders as a SINGLE composite image — Flow draws the whole grid as one picture. The topic field above is your story (mis. Kura-kura dan Kelinci); the locked template wraps it for you. For 2×3 / 2×4 the rows × cols flip with the aspect ratio so panels stay readable on both landscape and portrait composites." />
             </span>
             <div className="aspect-chip-row">
               {STORYBOARD_GRIDS.map((g) => {

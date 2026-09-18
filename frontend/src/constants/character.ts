@@ -5,22 +5,22 @@
 // / `node.data.charVibe` so the viewer can map back to a friendly label
 // across reloads.
 //
-// Labels are Vietnamese for the picker UI; `tag` is the English noun
+// Labels are Indonesian for the picker UI; `tag` is the English noun
 // injected into the dispatched prompt text.
 
 export const CHARACTER_GENDERS = [
-  { key: "male", label: "Nam", tag: "male" },
-  { key: "female", label: "Nữ", tag: "female" },
+  { key: "male", label: "Pria", tag: "male" },
+  { key: "female", label: "Wanita", tag: "female" },
 ] as const;
 
 export const CHARACTER_COUNTRIES = [
-  { key: "vn", label: "Việt Nam", tag: "Vietnamese" },
-  { key: "jp", label: "Nhật Bản", tag: "Japanese" },
-  { key: "kr", label: "Hàn Quốc", tag: "Korean" },
-  { key: "cn", label: "Trung Quốc", tag: "Chinese" },
-  { key: "th", label: "Thái Lan", tag: "Thai" },
-  { key: "us", label: "Mỹ", tag: "American" },
-  { key: "fr", label: "Pháp", tag: "French" },
+  { key: "vn", label: "Vietnam", tag: "Vietnamese" },
+  { key: "jp", label: "Jepang", tag: "Japanese" },
+  { key: "kr", label: "Korea", tag: "Korean" },
+  { key: "cn", label: "Tiongkok", tag: "Chinese" },
+  { key: "th", label: "Thailand", tag: "Thai" },
+  { key: "us", label: "Amerika", tag: "American" },
+  { key: "fr", label: "Prancis", tag: "French" },
 ] as const;
 
 // Vibe presets drive everything *except* framing: makeup/grooming, hair,

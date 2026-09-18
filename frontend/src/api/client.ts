@@ -110,7 +110,7 @@ export function getHealth() {
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
-export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "Storyboard";
+export type NodeType = "character" | "image" | "video" | "prompt" | "note" | "visual_asset" | "video_reference" | "Storyboard";
 export type NodeStatus = "idle" | "queued" | "running" | "done" | "error";
 
 export interface Board {
@@ -470,15 +470,40 @@ export interface UploadResponse {
   media_id: string;
   mime: string;
   size: number;
+  // "image" | "video" — set by the agent from the sniffed container.
+  kind?: string;
   // Detected by the agent from the image bytes; one of
   // IMAGE_ASPECT_RATIO_{SQUARE,PORTRAIT,LANDSCAPE}. Optional because legacy
-  // responses (or formats we couldn't sniff) skip the field.
+  // responses (or formats we couldn't sniff) skip the field. Video uploads
+  // never carry it.
   aspect_ratio?: string;
   width?: number;
   height?: number;
 }
 
 export async function uploadImage(
+  file: File,
+  projectId: string,
+  nodeId?: number,
+): Promise<UploadResponse> {
+  return uploadMedia(file, projectId, nodeId);
+}
+
+/**
+ * Upload a reference video (mp4 / webm / mov) to the board's Flow project.
+ * Same multipart route as images — the agent sniffs the container and
+ * records the Asset with kind="video", then returns the Flow media_id the
+ * v2v motion-transfer chat agent consumes as its VR motion source.
+ */
+export async function uploadVideo(
+  file: File,
+  projectId: string,
+  nodeId?: number,
+): Promise<UploadResponse> {
+  return uploadMedia(file, projectId, nodeId);
+}
+
+async function uploadMedia(
   file: File,
   projectId: string,
   nodeId?: number,
@@ -552,6 +577,49 @@ export async function describeMedia(mediaId: string): Promise<VisionDescribeResp
     throw new Error(await extractErrorMessage(res));
   }
   return res.json() as Promise<VisionDescribeResponse>;
+}
+
+export async function uploadVideoFromUrl(
+  url: string,
+  projectId: string,
+  nodeId?: number,
+): Promise<UploadResponse> {
+  const res = await fetch("/api/upload-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, project_id: projectId, node_id: nodeId }),
+  });
+  if (!res.ok) {
+    throw new Error(await extractErrorMessage(res));
+  }
+  return res.json() as Promise<UploadResponse>;
+}
+
+export interface ResolveUrlPickerItem {
+  type: string;
+  url: string;
+  thumb?: string;
+}
+
+export type ResolveUrlResponse =
+  | { mode: "direct"; url: string; mime?: string; provider?: string }
+  | { mode: "picker"; items: ResolveUrlPickerItem[]; provider?: string };
+
+/** Resolve a pasted link to a streamable video URL — no download.
+ * The URL is stored on the node as-is; bytes are only fetched
+ * (in-memory) at Generate time. Share links (TikTok/YouTube/IG)
+ * need FLOWBOARD_COBALT_API_URL on the agent; direct mp4 links
+ * always work. */
+export async function resolveVideoUrl(url: string): Promise<ResolveUrlResponse> {
+  const res = await fetch("/api/resolve-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  if (!res.ok) {
+    throw new Error(await extractErrorMessage(res));
+  }
+  return res.json() as Promise<ResolveUrlResponse>;
 }
 
 export async function uploadImageFromUrl(

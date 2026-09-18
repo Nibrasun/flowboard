@@ -54,22 +54,22 @@ function formatAspectRatio(value: string | undefined): string {
   }
 }
 
-/** Format an ISO timestamp as a Vietnamese relative time string —
- *  "vừa xong", "5 phút trước", "2 giờ trước", "3 ngày trước". Falls
+/** Format an ISO timestamp as an Indonesian relative time string —
+ *  "baru saja", "5 menit lalu", "2 jam lalu", "3 hari lalu". Falls
  *  back to "—" when the timestamp is missing or unparseable. */
 function formatRelativeTime(iso: string | undefined): string {
   if (!iso) return "—";
   const t = new Date(iso).getTime();
   if (isNaN(t)) return "—";
   const diffSec = Math.max(0, (Date.now() - t) / 1000);
-  if (diffSec < 60) return "vừa xong";
+  if (diffSec < 60) return "baru saja";
   const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin} phút trước`;
+  if (diffMin < 60) return `${diffMin} menit lalu`;
   const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr} giờ trước`;
+  if (diffHr < 24) return `${diffHr} jam lalu`;
   const diffDay = Math.floor(diffHr / 24);
-  if (diffDay < 7) return `${diffDay} ngày trước`;
-  return new Date(t).toLocaleDateString("vi-VN");
+  if (diffDay < 7) return `${diffDay} hari lalu`;
+  return new Date(t).toLocaleDateString("id-ID");
 }
 
 export function ResultViewer() {
@@ -109,7 +109,14 @@ export function ResultViewer() {
   //     or upload (no model). Render as plain text so the visual
   //     difference signals "estimate vs ground truth".
   const metadataModel: { label: string; isBadge: boolean } = (() => {
-    if (data?.type === "video") {
+    if (data?.type === "video" || data?.type === "video_reference") {
+      // v2v (motion transfer) has no quality tier — the chat agent picks
+      // the model server-side — so falling through to videoQuality/the
+      // settings default would show a "Fast"/"Ultra" label that's just
+      // wrong for this result, not merely an estimate.
+      if (data.referenceVideoMediaId) {
+        return { label: "Motion transfer (v2v)", isBadge: true };
+      }
       if (data.videoQuality) {
         return {
           label: VIDEO_QUALITY_LABELS[data.videoQuality] ?? data.videoQuality,
@@ -276,7 +283,7 @@ export function ResultViewer() {
 
   if (rfId === null || !data) return null;
 
-  const isVideo = data.type === "video";
+  const isVideo = data.type === "video" || data.type === "video_reference";
   const shortMediaId = currentMediaId ? `${currentMediaId.slice(0, 12)}…` : "pending";
 
   const cacheBust = cacheKey > 0 ? `?t=${cacheKey}` : "";

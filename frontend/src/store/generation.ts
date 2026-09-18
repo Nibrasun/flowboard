@@ -40,6 +40,14 @@ interface GenerationState {
       // prompt — required for batch auto-prompt to keep poses distinct
       // across the 4 generated images.
       prompts?: string[];
+      // Uploaded reference video (v2v motion source). Persisted on the
+      // node as data.referenceVideoMediaId and forwarded in the request
+      // params so the backend can route to the motion-transfer handler.
+      referenceVideoMediaId?: string;
+      // Link-only reference video (Add-link without download). Persisted
+      // as data.referenceVideoUrl; backend fetches it in-memory at
+      // Generate and routes to the same motion-transfer handler.
+      referenceVideoUrl?: string;
     },
   ): Promise<void>;
 
@@ -153,6 +161,10 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
     sourceMediaIds?: string[];
     variantCount?: number;
     prompts?: string[];
+    referenceVideoMediaId?: string;
+    // Link-only VR clip (Add-link without download) — backend fetches
+    // it in-memory and pushes straight to Flow at Generate time.
+    referenceVideoUrl?: string;
   }) {
     const projectId = await get().ensureProjectId();
     if (projectId === null) return;
@@ -201,7 +213,17 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
       const nodeDbId = parseInt(rfId, 10);
       if (kind === "video") {
         const settings = useSettingsStore.getState();
-        const isOmni = settings.videoModel === "omni_flash";
+        // A reference video always wins over the Omni/Veo model toggle —
+        // v2v (motion transfer) is a third, distinct pipeline (Google's
+        // chat-agent-dispatched "abra_edit"), not a mode of either Omni
+        // Flash or Veo i2v. Omni Flash's branch below has no concept of
+        // reference_video_media_id at all, so leaving isOmni true here
+        // when a reference video is attached would silently drop it —
+        // the dispatch would run as a plain Omni ingredient-conditioned
+        // gen with ZERO motion transfer, which is exactly the "motion
+        // doesn't follow the reference video" bug this guards against.
+        const isOmni =
+          settings.videoModel === "omni_flash" && !opts.referenceVideoMediaId && !opts.referenceVideoUrl;
 
         // Omni Flash takes a fundamentally different input shape from
         // Veo i2v. Veo wants ONE source image to use as the literal
@@ -262,6 +284,16 @@ export const useGenerationStore = create<GenerationState>((set, get) => ({
             // Backend resolves [tier][quality][aspect] → Flow model key.
             video_quality: settings.videoQuality,
           };
+          if (opts.referenceVideoMediaId) {
+            // Motion-transfer (v2v) input — the uploaded reference video.
+            // Backend routes to gen_video_v2v when present.
+            videoParams.reference_video_media_id = opts.referenceVideoMediaId;
+          }
+          if (opts.referenceVideoUrl) {
+            // Link-only motion source — backend fetches in-memory at
+            // Generate and routes to gen_video_v2v the same way.
+            videoParams.reference_video_url = opts.referenceVideoUrl;
+          }
           if (hasMulti) {
             videoParams.start_media_ids = opts.sourceMediaIds;
           } else {

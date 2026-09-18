@@ -1,6 +1,8 @@
 """Tests for the minimal Flow SDK. Uses a recording fake FlowClient so we can
 assert on the JSON-RPC shape without touching a real WS.
 """
+import json
+import urllib.parse
 from typing import Any
 
 import pytest
@@ -8,8 +10,8 @@ import pytest
 from flowboard.services.flow_sdk import (
     FlowSDK,
     _extract_inner_api_error,
-    _extract_project_id,
     _extract_media_ids,
+    _extract_project_id,
     extract_media_entries,
     extract_operation_names,
     extract_video_operations,
@@ -919,3 +921,118 @@ async def test_gen_image_propagates_prominent_people_filter():
     assert "error" in out
     assert "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED" in out["error"]
     assert "media_ids" not in out
+
+
+# ── video-to-video motion transfer (abra_edit, via batchexecute) ───────────
+
+
+def _batchexec_body(rpcid: str, payload: Any) -> str:
+    """Wire format Flow's Angular frontend answers with."""
+    row = json.dumps([["wrb.fr", rpcid, json.dumps(payload), None, None, None, "generic"]])
+    return ")]}'\n\n" + str(len(row)) + "\n" + row + "\n25\n"
+
+
+def _v2v_dispatch_payload(media_id: str = "media-1", workflow_id: str = "wf-1") -> list:
+    return [
+        None, 939,
+        [[media_id, None, None, ["title", [1, 2], None, None, workflow_id, "batch-1", [3, 4]], "proj-1"]],
+        [[]],
+    ]
+
+
+def _form_field(body: str, name: str) -> str:
+    return urllib.parse.parse_qs(body, keep_blank_values=True)[name][0]
+
+
+@pytest.mark.asyncio
+async def test_gen_video_v2v_posts_captured_jspb_shape():
+    c = RecordingClient()
+    c.api_response = {"status": 200, "data": _batchexec_body("jIps6", _v2v_dispatch_payload())}
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+
+    out = await sdk.gen_video_v2v(
+        prompt="animate it",
+        project_id="proj-1",
+        video_media_id="vid-1",
+        image_media_ids=["img-1", "img-2"],
+    )
+
+    assert out["media_id"] == "media-1"
+    assert out["workflow_id"] == "wf-1"
+
+    call = c.api_calls[0]
+    assert call["url"].startswith(
+        "https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=jIps6"
+    )
+    assert call["captcha_action"] == "VIDEO_GENERATION"
+    assert call["headers"]["x-same-domain"] == "1"
+    # The XSRF token is page state — the extension fills the placeholder in.
+    assert _form_field(call["body"], "at") == "__FLOWBOARD_AT__"
+
+    rpc = json.loads(_form_field(call["body"], "f.req"))[0][0]
+    assert rpc[0] == "jIps6"
+    inner = json.loads(rpc[1])
+    job, ctx, session = inner
+    assert job[0][0] == [None, "vid-1", 0, 240]
+    # Appearance refs ride twice: as prompt mentions and as reference images.
+    assert job[0][1][2] == [[[None, [["img-1", "img-1.jpg"], ["img-2", "img-2.jpg"]]], ["animate it"]]]
+    assert job[0][2] == "abra_edit"
+    assert job[0][8] == [[None, "img-1"], [None, "img-2"]]
+    assert ctx[5] == "proj-1"
+    assert ctx[10] == ["__FLOWBOARD_RECAPTCHA__", 1]
+    assert session[1] == 2
+
+
+@pytest.mark.asyncio
+async def test_gen_video_v2v_requires_video_and_image_ids():
+    c = RecordingClient()
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.gen_video_v2v(prompt="x", project_id="p", video_media_id="", image_media_ids=["i1"])
+    assert out["error"] == "missing_video_media_id"
+    out2 = await sdk.gen_video_v2v(prompt="x", project_id="p", video_media_id="v1", image_media_ids=[])
+    assert out2["error"] == "missing_image_media_ids"
+    assert c.api_calls == []
+
+
+@pytest.mark.asyncio
+async def test_gen_video_v2v_surfaces_missing_job():
+    c = RecordingClient()
+    c.api_response = {"status": 200, "data": _batchexec_body("jIps6", [None, 939, [], []])}
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.gen_video_v2v(prompt="x", project_id="p", video_media_id="v1", image_media_ids=["i1"])
+    assert out["error"] == "no_job_in_dispatch_response"
+
+
+@pytest.mark.asyncio
+async def test_check_v2v_status_done_once_video_url_appears():
+    url = "https://flow-content.google/video/wf-1?Expires=1&Signature=abc"
+    c = RecordingClient()
+    c.api_response = {"status": 200, "data": _batchexec_body("as29s", ["wf-1", "proj-1", "media-1", [None, [3]], url])}
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+
+    out = await sdk.check_v2v_status("wf-1", "media-1")
+
+    assert json.loads(_form_field(c.api_calls[0]["body"], "f.req"))[0][0][1] == '["wf-1"]'
+    assert c.api_calls[0].get("captcha_action") is None
+    assert out["done"] is True
+    assert out["media_entries"] == [{"media_id": "media-1", "url": url, "kind": "video"}]
+
+
+@pytest.mark.asyncio
+async def test_check_v2v_status_pending_is_not_done():
+    c = RecordingClient()
+    c.api_response = {"status": 200, "data": _batchexec_body("as29s", ["wf-1", "proj-1", "media-1", [None, [2]]])}
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.check_v2v_status("wf-1", "media-1")
+    assert out["done"] is False
+    assert out["media_entries"] == []
+
+
+@pytest.mark.asyncio
+async def test_check_v2v_status_reports_transport_error():
+    c = RecordingClient()
+    c.api_response = {"error": "NO_XSRF_TOKEN_ON_PAGE"}
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.check_v2v_status("wf-1", "media-1")
+    assert out["done"] is False
+    assert out["error"] == "NO_XSRF_TOKEN_ON_PAGE"

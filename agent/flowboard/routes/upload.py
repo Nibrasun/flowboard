@@ -1,16 +1,24 @@
-"""User image upload to Google Flow.
+"""User image/video upload to Google Flow.
 
 Multipart upload that base64-encodes the bytes, hands them to
 ``FlowSDK.upload_image`` (which goes through the extension to
 ``/v1/flow/uploadImage``), and on success caches the bytes locally keyed by
 the Flow-issued media_id.
 
+Images and short reference videos share the same route — Flow's uploadImage
+is a generic media upload (the ``imageBytes`` field carries any media the
+``mimeType`` describes; video is how the v2v motion-transfer chat agent
+receives its reference clip). The route sniffs magic bytes to classify
+video vs image, applies the right size cap and mime allowlist, and records
+the Asset row with ``kind`` = ``image`` | ``video``.
+
 Design choices:
 - Run synchronously rather than through the worker queue. Upload is one
-  round-trip and the caller (character node UI) needs the media_id immediately.
+  round-trip and the caller (character node UI / v2v dialog) needs the
+  media_id immediately.
 - Project-scoped: Flow's uploadImage requires ``clientContext.projectId``.
   Frontend must call ``ensureBoardProject`` first and pass the ``project_id``.
-- 10 MB cap and ``image/*`` mime allowlist applied here as defence-in-depth;
+- Size caps and mime allowlists applied here as defence-in-depth;
   the route never trusts the browser-supplied content-type alone.
 """
 from __future__ import annotations
@@ -36,19 +44,47 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["upload"])
 
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB (images)
+MAX_VIDEO_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB (reference video clips)
 ALLOWED_UPLOAD_MIMES = {
     "image/jpeg",
     "image/png",
     "image/webp",
     "image/gif",
 }
+ALLOWED_VIDEO_MIMES = {
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+}
 _EXT_BY_MIME = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/webp": ".webp",
     "image/gif": ".gif",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
 }
+
+
+def _sniff_video_mime(raw: bytes) -> Optional[str]:
+    """Detect mp4/mov/webm from magic bytes.
+
+    MP4 and QuickTime both start with a size+``ftyp`` box — the major brand
+    (bytes 8-12) disambiguates: ``qt  `` → QuickTime, anything else → MP4.
+    WebM (EBML container) starts with the 0x1A45DFA3 doc-id marker.
+    """
+    if len(raw) < 12:
+        return None
+    if raw[4:8] == b"ftyp":
+        brand = raw[8:12]
+        if brand == b"qt  ":
+            return "video/quicktime"
+        return "video/mp4"
+    if raw[:4] == b"\x1a\x45\xdf\xa3":
+        return "video/webm"
+    return None
 
 
 def _sniff_image_mime(raw: bytes) -> Optional[str]:
@@ -174,25 +210,42 @@ def _is_public_host(host: str) -> bool:
     return True
 
 
-async def _ingest_image_bytes(
+async def _ingest_media_bytes(
     raw: bytes,
     mime: str,
     project_id: str,
     file_name: str,
     node_id: Optional[int],
+    *,
+    kind: str = "image",
 ) -> dict:
-    """Push bytes to Flow's uploadImage, cache locally, upsert Asset row."""
-    image_b64 = base64.b64encode(raw).decode("ascii")
-    resp = await get_flow_sdk().upload_image(
-        image_base64=image_b64,
-        mime_type=mime,
-        project_id=project_id,
-        file_name=file_name,
-    )
+    """Push bytes to Flow, cache locally, upsert Asset row.
+
+    ``kind`` is recorded on the Asset row (``image`` | ``video``) so the
+    media cache / status API can distinguish upload provenance. Images go
+    through ``uploadImage``; videos go through the labs.google resumable
+    ``upload-video`` endpoint (``uploadImage`` 400s on video bytes with
+    INVALID_ARGUMENT) — see ``FlowSDK.upload_video``.
+    """
+    if kind == "video":
+        resp = await get_flow_sdk().upload_video(
+            video_bytes=raw,
+            mime_type=mime,
+            project_id=project_id,
+            file_name=file_name,
+        )
+    else:
+        image_b64 = base64.b64encode(raw).decode("ascii")
+        resp = await get_flow_sdk().upload_image(
+            image_base64=image_b64,
+            mime_type=mime,
+            project_id=project_id,
+            file_name=file_name,
+        )
     if resp.get("error"):
         raise HTTPException(
             status_code=502,
-            detail={"message": resp["error"], "raw": resp.get("raw")},
+            detail={"message": resp["error"], "stage": resp.get("stage"), "raw": resp.get("raw")},
         )
     media_id = resp.get("media_id")
     if not isinstance(media_id, str) or not media_service.is_valid_media_id(media_id):
@@ -214,7 +267,7 @@ async def _ingest_image_bytes(
         if row is None:
             row = Asset(
                 uuid_media_id=media_id,
-                kind="image",
+                kind=kind,
                 local_path=str(cache_path),
                 mime=mime,
                 node_id=node_id,
@@ -226,13 +279,14 @@ async def _ingest_image_bytes(
                 row.node_id = node_id
         s.add(row)
         s.commit()
-    out: dict = {"media_id": media_id, "mime": mime, "size": len(raw)}
-    dims = _sniff_image_dimensions(raw)
-    if dims is not None:
-        w, h = dims
-        out["width"] = w
-        out["height"] = h
-        out["aspect_ratio"] = _classify_aspect(w, h)
+    out: dict = {"media_id": media_id, "mime": mime, "size": len(raw), "kind": kind}
+    if kind == "image":
+        dims = _sniff_image_dimensions(raw)
+        if dims is not None:
+            w, h = dims
+            out["width"] = w
+            out["height"] = h
+            out["aspect_ratio"] = _classify_aspect(w, h)
     return out
 
 
@@ -246,27 +300,55 @@ async def upload_image(
         raise HTTPException(status_code=400, detail="invalid project_id")
 
     mime = (file.content_type or "").lower().split(";")[0].strip()
-    if mime not in ALLOWED_UPLOAD_MIMES:
+    is_video = mime in ALLOWED_VIDEO_MIMES
+    if not is_video and mime not in ALLOWED_UPLOAD_MIMES:
         raise HTTPException(
             status_code=415,
-            detail=f"unsupported mime: {mime!r}; allowed: {sorted(ALLOWED_UPLOAD_MIMES)}",
+            detail=f"unsupported mime: {mime!r}; allowed: {sorted(ALLOWED_UPLOAD_MIMES | ALLOWED_VIDEO_MIMES)}",
         )
 
     # Read with a hard cap so a hostile client can't OOM us by streaming
     # forever. Read MAX+1 bytes; if we got more than MAX, reject.
-    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    # Videos get a much larger budget than images (reference clips are
+    # typically 5–50 MB; the 200 MB ceiling covers 4K sources).
+    cap = MAX_VIDEO_UPLOAD_BYTES if is_video else MAX_UPLOAD_BYTES
+    raw = await file.read(cap + 1)
     size = len(raw)
     if size == 0:
         raise HTTPException(status_code=400, detail="empty file")
-    if size > MAX_UPLOAD_BYTES:
+    if size > cap:
         raise HTTPException(
             status_code=413,
-            detail=f"file too large: {size} > {MAX_UPLOAD_BYTES}",
+            detail=f"file too large: {size} > {cap}",
         )
 
+    # Magic-byte sniff is the source of truth (a browser may lie about
+    # content-type). For video we also fall back to sniffing when the
+    # declared type is ambiguous; a mismatch between declared and sniffed
+    # type is resolved in favour of the bytes.
+    if is_video:
+        sniffed = _sniff_video_mime(raw)
+        if sniffed is None:
+            raise HTTPException(
+                status_code=415,
+                detail=f"not a recognized video container (content-type {mime!r}, no ftyp/EBML magic)",
+            )
+        mime = sniffed
+    else:
+        sniffed = _sniff_image_mime(raw)
+        if sniffed is None:
+            raise HTTPException(
+                status_code=415,
+                detail=f"not an image (content-type {mime!r}, no magic bytes match)",
+            )
+        mime = sniffed
+
     file_name = file.filename or f"upload{_EXT_BY_MIME.get(mime, '')}"
-    out = await _ingest_image_bytes(raw, mime, project_id, file_name, node_id)
-    logger.info("upload: media_id=%s size=%d mime=%s", out["media_id"], size, mime)
+    out = await _ingest_media_bytes(
+        raw, mime, project_id, file_name, node_id,
+        kind="video" if is_video else "image",
+    )
+    logger.info("upload: media_id=%s size=%d mime=%s kind=%s", out["media_id"], size, mime, out["kind"])
     return out
 
 
@@ -278,9 +360,11 @@ class UrlUploadBody(BaseModel):
 
 @router.post("/upload-url")
 async def upload_image_from_url(body: UrlUploadBody):
-    """Fetch an image at ``body.url`` server-side, validate, then push it
+    """Fetch an image or video at ``body.url`` server-side, validate, then push it
     through the same Flow upload pipeline as ``/upload``. CORS-free
-    alternative to having the browser fetch the URL itself."""
+    alternative to having the browser fetch the URL itself. Video URLs
+    (mp4/webm/mov) are ingested with ``kind="video"`` so VR nodes can
+    Add-link a motion clip the same way visual assets link images."""
     if not is_valid_project_id(body.project_id):
         raise HTTPException(status_code=400, detail="invalid project_id")
 
@@ -309,33 +393,37 @@ async def upload_image_from_url(body: UrlUploadBody):
     size = len(raw)
     if size == 0:
         raise HTTPException(status_code=502, detail="empty response body")
-    if size > MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413, detail=f"file too large: {size} > {MAX_UPLOAD_BYTES}"
-        )
 
     mime = (resp.headers.get("content-type", "") or "").lower().split(";")[0].strip()
     # Server's Content-Type is the hint; magic-byte sniff is the source of
     # truth (a misconfigured server, or one returning text/html for an HTTP
-    # error masquerading as 200, must not slip through).
-    sniffed = _sniff_image_mime(raw)
-    if mime not in ALLOWED_UPLOAD_MIMES:
+    # error masquerading as 200, must not slip through). Both image and
+    # video containers are accepted — VR nodes fetch mp4/webm/mov clips.
+    sniffed = _sniff_image_mime(raw) or _sniff_video_mime(raw)
+    allowed = ALLOWED_UPLOAD_MIMES | ALLOWED_VIDEO_MIMES
+    if mime not in allowed:
         if sniffed is None:
             raise HTTPException(
                 status_code=415,
-                detail=f"not an image (content-type {mime!r}, no magic bytes match)",
+                detail=f"not an image or video (content-type {mime!r}, no magic bytes match)",
             )
         mime = sniffed
     elif sniffed is not None and sniffed != mime:
         # Trust the magic bytes if they disagree.
         mime = sniffed
+    kind = "video" if mime in ALLOWED_VIDEO_MIMES else "image"
+    cap = MAX_VIDEO_UPLOAD_BYTES if kind == "video" else MAX_UPLOAD_BYTES
+    if size > cap:
+        raise HTTPException(
+            status_code=413, detail=f"file too large: {size} > {cap}"
+        )
 
     # Derive a filename from the URL path or fall back to a generic one.
-    path_name = (parsed.path.rstrip("/").rsplit("/", 1)[-1] or "image").lower()
+    path_name = (parsed.path.rstrip("/").rsplit("/", 1)[-1] or kind).lower()
     if "." not in path_name:
         path_name = path_name + _EXT_BY_MIME.get(mime, "")
 
-    out = await _ingest_image_bytes(raw, mime, body.project_id, path_name, body.node_id)
+    out = await _ingest_media_bytes(raw, mime, body.project_id, path_name, body.node_id, kind=kind)
     logger.info(
         "upload-url: media_id=%s size=%d mime=%s host=%s",
         out["media_id"], size, mime, parsed.netloc,

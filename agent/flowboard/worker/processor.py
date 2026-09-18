@@ -29,6 +29,9 @@ Handler = Callable[[dict], Awaitable[tuple[dict, Optional[str]]]]
 
 _ALLOWED_URL_PREFIXES: tuple[str, ...] = (
     "https://aisandbox-pa.googleapis.com/",
+    # Resumable reference-video upload — labs.google web endpoint proxied
+    # with the browser session's cookies (see extension/background.js).
+    "https://labs.google/fx/tools/flow/api/upload-video",
 )
 
 
@@ -46,6 +49,7 @@ async def _handle_proxy(params: dict) -> tuple[dict, Optional[str]]:
         method=method,
         headers=params.get("headers") or {},
         body=params.get("body"),
+        body_b64=params.get("bodyB64"),
     )
     if not isinstance(resp, dict):
         return {"value": resp}, None
@@ -169,6 +173,63 @@ def _is_request_canceled(rid: Optional[int]) -> bool:
         return req.status == "canceled"
 
 
+async def _ingest_reference_url(project_id: str, url: str) -> tuple[Optional[str], Optional[str]]:
+    """Fetch a link-only VR clip and push it straight to Flow.
+
+    Returns (media_id, None) on success or (None, error_code). Bytes are
+    streamed in-memory — never written to storage/media. The Add-link step
+    stores only the URL, so this runs lazily at Generate time.
+    """
+    from flowboard.routes.upload import (
+        ALLOWED_VIDEO_MIMES,
+        MAX_VIDEO_UPLOAD_BYTES,
+        _is_public_host,
+        _sniff_video_mime,
+    )
+    from flowboard.services.flow_sdk import get_flow_sdk
+    from flowboard.services.url_resolve import (
+        ResolveError,
+        fetch_video_bytes,
+        resolve_video_url,
+    )
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not _is_public_host(parsed.hostname or ""):
+        return None, "ref_url_not_public"
+    try:
+        resolved = await resolve_video_url(url)
+    except ResolveError as exc:
+        return None, f"ref_url_unresolvable: {exc}"[:200]
+    if resolved.get("mode") == "picker":
+        return None, "ref_url_needs_choice"
+    direct = resolved.get("url")
+    if not isinstance(direct, str) or not direct:
+        return None, "ref_url_unresolvable"
+    dparsed = urlparse(direct)
+    if dparsed.scheme not in ("http", "https") or not _is_public_host(dparsed.hostname or ""):
+        return None, "ref_url_not_public"
+    try:
+        raw, header_mime = await fetch_video_bytes(direct, MAX_VIDEO_UPLOAD_BYTES)
+    except ResolveError as exc:
+        return None, f"ref_url_fetch_failed: {exc}"[:200]
+    mime = header_mime if header_mime in ALLOWED_VIDEO_MIMES else (_sniff_video_mime(raw) or "")
+    if mime not in ALLOWED_VIDEO_MIMES:
+        return None, f"ref_url_not_video: {header_mime!r}"[:200]
+    resp = await get_flow_sdk().upload_video(
+        video_bytes=raw,
+        mime_type=mime,
+        project_id=project_id,
+        file_name=(dparsed.path.rstrip("/").rsplit("/", 1)[-1] or "ref.mp4").lower(),
+    )
+    if resp.get("error"):
+        return None, f"ref_url_flow_upload_failed: {resp.get('error')}"[:200]
+    media_id = resp.get("media_id")
+    if not isinstance(media_id, str) or not media_id:
+        return None, "ref_url_flow_upload_failed: no_media_id"
+    return media_id, None
+
+
 async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
     from flowboard.services.flow_sdk import is_valid_project_id
 
@@ -193,6 +254,31 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
         not isinstance(start_media_id, str) or not start_media_id.strip()
     ):
         return {}, "missing_start_media_id"
+
+    # Motion-transfer (v2v) branch — a reference video was uploaded, so the
+    # appearance image(s) in start_media_id(s) drive gen_video_v2v (the chat
+    # agent) instead of the Veo i2v batch endpoint. No paygate_tier / aspect
+    # / quality involved — the agent picks the model server-side.
+    reference_video_media_id = params.get("reference_video_media_id")
+    if not (isinstance(reference_video_media_id, str) and reference_video_media_id.strip()):
+        # Link-only VR: Add-link stored just the URL (no local download).
+        # Fetch it now (in-memory) and push straight to Flow.
+        reference_video_url = params.get("reference_video_url")
+        if isinstance(reference_video_url, str) and reference_video_url.strip():
+            lazy_id, lazy_err = await _ingest_reference_url(project_id, reference_video_url.strip())
+            if lazy_err:
+                return {}, lazy_err
+            reference_video_media_id = lazy_id
+    if isinstance(reference_video_media_id, str) and reference_video_media_id.strip():
+        image_media_ids = start_media_ids or [start_media_id.strip()]
+        return await _handle_gen_video_v2v(
+            prompt=prompt.strip(),
+            project_id=project_id,
+            video_media_id=reference_video_media_id.strip(),
+            image_media_ids=image_media_ids,
+            rid=params.get("__request_id"),
+        )
+
     aspect = params.get("aspect_ratio") or "VIDEO_ASPECT_RATIO_LANDSCAPE"
     # Tier resolution — see the matching block in _handle_gen_image for
     # the rationale. No silent default; missing tier is a hard error so
@@ -383,6 +469,83 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
             "op_errors": op_errors,
             "slot_errors": slot_errors,
             "partial_error": partial_error,
+        },
+        None,
+    )
+
+
+async def _handle_gen_video_v2v(
+    *,
+    prompt: str,
+    project_id: str,
+    video_media_id: str,
+    image_media_ids: list[str],
+    rid: Optional[int],
+) -> tuple[dict, Optional[str]]:
+    """Motion-transfer (v2v) dispatch — kicks off gen_video_v2v (one JSPB
+    batchexecute rpc) then polls check_v2v_status by workflow id. Single
+    job, not a batch, so no per-slot/positional bookkeeping like
+    _handle_gen_video's Veo path — but the result still carries
+    ``media_ids``/``media_entries`` so the frontend's shared
+    result-handling code (keyed on those fields) works unmodified here too.
+    """
+    sdk = get_flow_sdk()
+    dispatch = await sdk.gen_video_v2v(
+        prompt=prompt,
+        project_id=project_id,
+        video_media_id=video_media_id,
+        image_media_ids=image_media_ids,
+    )
+    if dispatch.get("error"):
+        return dispatch, str(dispatch["error"])[:200]
+    media_id = dispatch.get("media_id")
+    if not isinstance(media_id, str) or not media_id:
+        return dispatch, "no_media_id_returned"
+    workflow_id = dispatch.get("workflow_id")
+    if not isinstance(workflow_id, str) or not workflow_id:
+        return dispatch, "no_workflow_id_returned"
+
+    poll_attempts = 0
+    last_poll: dict = {}
+    while poll_attempts < VIDEO_POLL_MAX_CYCLES:
+        await asyncio.sleep(VIDEO_POLL_INTERVAL_S)
+        poll_attempts += 1
+        if _is_request_canceled(rid):
+            return (
+                {"raw_dispatch": dispatch, "last_poll": last_poll, "canceled": True},
+                "canceled",
+            )
+        last_poll = await sdk.check_v2v_status(workflow_id, media_id)
+        if last_poll.get("error") and not last_poll.get("done"):
+            continue
+        if last_poll.get("done"):
+            break
+    else:
+        return (
+            {"raw_dispatch": dispatch, "last_poll": last_poll},
+            "timeout_waiting_video",
+        )
+
+    if last_poll.get("error"):
+        return {"raw_dispatch": dispatch, "last_poll": last_poll}, str(last_poll["error"])[:200]
+
+    entries = last_poll.get("media_entries") or []
+    if not entries:
+        return {"raw_dispatch": dispatch, "last_poll": last_poll}, "no_media_in_poll_response"
+
+    entries_with_urls = [e for e in entries if isinstance(e, dict) and e.get("url")]
+    if entries_with_urls:
+        try:
+            media_service.ingest_urls(entries_with_urls)
+        except Exception:  # noqa: BLE001
+            logger.exception("auto-ingest from gen_video_v2v response failed")
+
+    return (
+        {
+            "raw_dispatch": dispatch,
+            "last_poll": last_poll,
+            "media_ids": [media_id],
+            "media_entries": entries,
         },
         None,
     )

@@ -21,7 +21,18 @@ let metrics = {
   lastError:       null,
 };
 
-const flowUrls = ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'];
+// Google Flow moved from labs.google/fx/tools/flow to flow.google.com in
+// early 2026 (Whisk/ImageFX merge) but users can still land on either
+// depending on how they got there / redirects. Every tab lookup for "is
+// this a Flow tab" must go through this ONE list — three separate call
+// sites used to hardcode their own copy and only one got updated when
+// flow.google.com was added, so a tab open on the new domain was
+// invisible to solveCaptcha() and surfaced as NO_FLOW_TAB.
+const flowUrls = [
+  'https://labs.google/fx/tools/flow*',
+  'https://labs.google/fx/*/tools/flow*',
+  'https://flow.google.com/*',
+];
 
 // ─── URL → Log Type Classifier ─────────────────────────────
 
@@ -29,6 +40,7 @@ function classifyUrl(url) {
   if (url.includes('batchGenerateImages'))     return 'GEN_IMG';
   if (url.includes('batchAsyncGenerateVideo')) return 'GEN_VID';
   if (url.includes('batchCheckAsync'))         return 'POLL';
+  if (url.includes('flowCreationAgent'))       return 'AGENT_CHAT';
   return 'API';
 }
 
@@ -297,15 +309,54 @@ function sendToAgent(msg) {
   }
 }
 
+// ─── Page-origin relay ──────────────────────────────────────────
+// Runs a fetch inside a flow.google.com tab via the content script so
+// same-origin cookie auth applies and custom headers skip CORS
+// preflight. Returns the relay reply or null when no Flow tab is ready.
+async function relayViaFlowTab(fetchParams) {
+  try {
+    const tabs = await chrome.tabs.query({ url: ['https://flow.google.com/*'] });
+    const tab = tabs.find((t) => t.id != null && !t.discarded) || tabs[0];
+    if (!tab || tab.id == null) return null;
+    // Never hang the agent: no reply (no matching frame) falls back.
+    const reply = await Promise.race([
+      chrome.tabs.sendMessage(tab.id, {
+        type: 'PAGE_FETCH', params: fetchParams,
+      }),
+      new Promise((resolve) => setTimeout(() => resolve(null), 240000)),
+    ]);
+    if (!reply || (reply.status == null && !reply.error)) return null;
+    return reply;
+  } catch {
+    return null; // no content script yet / tab unreachable → SW fallback
+  }
+}
+
 // ─── API Request Proxy ──────────────────────────────────────
+
+// Endpoints that must run from the Flow page origin (cookie session, no
+// CORS preflight): resumable video upload + the frontend batchexecute rpc.
+function isPageRelayUrl(url) {
+  return (
+    url.startsWith('https://labs.google/fx/tools/flow/api/upload-video') ||
+    url.startsWith('https://flow.google.com/upload/v1/flow/upload/') ||
+    url.startsWith('https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute')
+  );
+}
 
 async function handleApiRequest(msg) {
   const { id, params } = msg;
   const { url, method, headers, body, captchaAction } = params || {};
 
   if (!url || !url.startsWith('https://aisandbox-pa.googleapis.com/')) {
-    sendToAgent({ id, status: 400, error: 'INVALID_URL' });
-    return;
+    // Two flow.google.com web endpoints are allowed alongside aisandbox-pa:
+    // the resumable upload-video protocol, and the Angular frontend's
+    // batchexecute rpc (the only route to video-to-video motion transfer).
+    // Everything else stays tightly scoped to aisandbox-pa.
+    if (!isPageRelayUrl(url)) {
+      sendToAgent({ id, status: 400, error: 'INVALID_URL' });
+      return;
+    }
   }
 
   setState('running');
@@ -352,10 +403,22 @@ async function handleApiRequest(msg) {
 
     // Step 2: Inject captcha token into body clone if present
     let finalBody = body;
-    if (captchaToken && finalBody) {
+    if (captchaToken && typeof finalBody === 'string') {
+      // batchexecute bodies are form strings carrying JSPB, so the token
+      // goes in by placeholder rather than by object path.
+      finalBody = finalBody.split('__FLOWBOARD_RECAPTCHA__').join(
+        encodeURIComponent(captchaToken),
+      );
+    } else if (captchaToken && finalBody) {
       finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
       if (finalBody.clientContext?.recaptchaContext) {
         finalBody.clientContext.recaptchaContext.token = captchaToken;
+      }
+      // flowCreationAgent:streamChat nests recaptchaContext under
+      // agentClientContext instead of clientContext — different envelope
+      // from the classic gen/edit endpoints.
+      if (finalBody.agentClientContext?.recaptchaContext) {
+        finalBody.agentClientContext.recaptchaContext.token = captchaToken;
       }
       if (finalBody.requests && Array.isArray(finalBody.requests)) {
         for (const req of finalBody.requests) {
@@ -364,6 +427,74 @@ async function handleApiRequest(msg) {
           }
         }
       }
+    }
+
+    const isUploadVideo = isPageRelayUrl(url);
+
+    // Upload-video: raw resumable-upload protocol. Prefer the page-origin
+    // relay (content script on a flow.google.com tab): same-origin fetch
+    // sends custom X-Goog-Upload-* headers verbatim with cookies and no
+    // CORS preflight. Fall back to SW fetch if no Flow tab is available.
+    // batchexecute takes the same relay — plus the page's XSRF token,
+    // which only the content script can read.
+    if (isUploadVideo) {
+      const pageRelay = await relayViaFlowTab({
+        url, method: method || 'POST', headers: headers || {},
+        bodyB64: params.bodyB64 || null,
+        bodyText: typeof finalBody === 'string' ? finalBody : null,
+      });
+      if (pageRelay) {
+        const { status, data, headers: respHeaders, error } = pageRelay;
+        const dbg = { dbgSentBytes: pageRelay.dbgSentBytes, dbgGotHeaders: pageRelay.dbgGotHeaders };
+        if (error) {
+          sendToAgent({ id, status: status || 500, error, via: 'page-relay', ...dbg });
+          updateRequestLog(id, { status: 'failed', error });
+        } else {
+          sendToAgent({ id, status, data, headers: respHeaders || {}, via: 'page-relay', ...dbg });
+          updateRequestLog(id, {
+            status: status >= 200 && status < 300 ? 'success' : 'failed',
+            httpStatus: status,
+            error: status >= 200 && status < 300 ? undefined : `API_${status}`,
+          });
+        }
+        chrome.storage.local.set({ metrics });
+        setState('idle');
+        return;
+      }
+      const uploadHeaders = { ...(headers || {}) };
+      let uploadBody = undefined;
+      if (params.bodyB64) {
+        const bin = atob(params.bodyB64);
+        uploadBody = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) uploadBody[i] = bin.charCodeAt(i);
+      } else if (typeof finalBody === 'string') {
+        uploadBody = finalBody;
+      } else if (finalBody !== undefined && finalBody !== null) {
+        uploadBody = JSON.stringify(finalBody);
+      }
+      try {
+        const uvResp = await fetch(url, {
+          method: method || 'POST',
+          headers: uploadHeaders,
+          credentials: 'include',
+          body: method === 'GET' ? undefined : uploadBody,
+        });
+        const uvText = await uvResp.text();
+        const uvHeaders = {};
+        uvResp.headers.forEach((v, k) => { uvHeaders[k] = v; });
+        sendToAgent({ id, status: uvResp.status, data: uvText, headers: uvHeaders, via: 'sw-fetch' });
+        updateRequestLog(id, {
+          status: uvResp.ok ? 'success' : 'failed',
+          httpStatus: uvResp.status,
+          error: uvResp.ok ? undefined : `API_${uvResp.status}`,
+        });
+      } catch (e) {
+        sendToAgent({ id, status: 500, error: e.message || 'UPLOAD_VIDEO_FAILED' });
+        updateRequestLog(id, { status: 'failed', error: e.message || 'UPLOAD_VIDEO_FAILED' });
+      }
+      chrome.storage.local.set({ metrics });
+      setState('idle');
+      return;
     }
 
     const fetchHeaders = { ...(headers || {}), authorization: `Bearer ${flowKey}` };
@@ -432,9 +563,7 @@ async function openFlowTabResilient(active = false) {
 }
 
 async function captureTokenFromFlowTab() {
-  const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-  });
+  const tabs = await chrome.tabs.query({ url: flowUrls });
 
   if (!tabs.length) {
     if (_openingFlowTab) return;
@@ -675,9 +804,7 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
   }
 
   if (msg.type === 'OPEN_FLOW_TAB') {
-    chrome.tabs.query({
-      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
-    }).then(async (tabs) => {
+    chrome.tabs.query({ url: flowUrls }).then(async (tabs) => {
       try {
         if (tabs.length) {
           await chrome.tabs.update(tabs[0].id, { active: true });

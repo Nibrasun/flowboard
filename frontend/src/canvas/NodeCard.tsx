@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { useBoardStore, type FlowboardNodeData, type FlowNode } from "../store/board";
 import { useGenerationStore } from "../store/generation";
-import { mediaUrl, patchEdge, patchNode, uploadImage, uploadImageFromUrl } from "../api/client";
+import { mediaUrl, patchEdge, patchNode, resolveVideoUrl, uploadImage, uploadImageFromUrl, uploadVideo, type ResolveUrlPickerItem } from "../api/client";
 import { requestAutoBrief } from "../api/autoBrief";
 import { useReferencesStore } from "../store/references";
 import {
@@ -17,6 +17,7 @@ const ICON: Record<string, string> = {
   prompt: "✦",
   note: "✎",
   visual_asset: "◇",
+  video_reference: "❏",
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -963,6 +964,30 @@ function VideoBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
   const ids = data.mediaIds ?? (data.mediaId ? [data.mediaId] : []);
   const isProcessing = data.status === "queued" || data.status === "running";
   const isError = data.status === "error";
+  // Fresh node, never dispatched — the tile grid's placeholder (a
+  // decorative ▶ glyph, aria-hidden, no click handler) reads exactly
+  // like a play/generate button but does nothing, which is the actual
+  // "there's no generate feature" complaint: the real trigger is the
+  // small header ▶ icon, easy to miss. Show an explicit Generate button
+  // here instead, matching Image/VisualAsset/Character's empty state.
+  const isIdle = !isProcessing && !isError && ids.length === 0;
+  if (isIdle) {
+    return (
+      <div className="node-body node-body--video">
+        <div className="character-empty">
+          <button
+            type="button"
+            className="visual-asset__action"
+            onClick={() =>
+              useGenerationStore.getState().openGenerationDialog(rfId, data.prompt ?? "")
+            }
+          >
+            Generate
+          </button>
+        </div>
+      </div>
+    );
+  }
   // Partial-batch case: status="done" + an error string means some
   // variants succeeded and others got blocked (filter / timeout).
   // Slot-level signal: `mediaIds[i] === null` is a positional
@@ -974,9 +999,13 @@ function VideoBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
   // become the per-tile poster so the static preview shows the same
   // subject-centered framing as the upstream image card. Multi-source
   // i2v: variant i of the video came from variant i of the upstream
-  // image; single-source: every tile shares the same poster.
+  // image; single-source: every tile shares the same poster. Excludes
+  // video_reference sources — that edge feeds the motion clip (a video,
+  // not a poster-able image), and a video node can have both edges.
   const { nodes, edges } = useBoardStore.getState();
-  const upstreamEdge = edges.find((e) => e.target === rfId);
+  const upstreamEdge = edges.find(
+    (e) => e.target === rfId && nodes.find((n) => n.id === e.source)?.data.type !== "video_reference",
+  );
   const upstreamNode = upstreamEdge
     ? nodes.find((n) => n.id === upstreamEdge.source)
     : undefined;
@@ -1019,6 +1048,14 @@ function VideoBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
 
   return (
     <div className="node-body node-body--video">
+      {(data.referenceVideoMediaId || data.referenceVideoUrl) && (
+        <span
+          className="video-ref-badge"
+          title={`Motion transfer (v2v) source: ${data.referenceVideoName ?? "VR"}`}
+        >
+          ❏ v2v
+        </span>
+      )}
       <div className={`video-grid video-grid--${tileCount}`}>
         {tiles}
       </div>
@@ -1030,6 +1067,352 @@ function VideoBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
           {data.error}
         </p>
       )}
+    </div>
+  );
+}
+
+// ── Video reference (v2v motion source) ──────────────────────────────────
+//
+// Standalone node so the motion-source clip can live on the canvas and be
+// wired into a Video node with a plain edge — mirrors how visual_asset
+// feeds appearance refs. GenerationDialog reads the connected node's
+// mediaId as `reference_video_media_id`; uploading inline in the dialog
+// still works as a fallback when no such node is wired up.
+function VideoReferenceBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
+  const mediaId = data.mediaId;
+  const remoteUrl = typeof data.referenceVideoUrl === "string" ? data.referenceVideoUrl : undefined;
+  const isProcessing = data.status === "queued" || data.status === "running";
+  const [uploading, setUploading] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [linkMode, setLinkMode] = useState(false);
+  const [linkValue, setLinkValue] = useState("");
+  const [picker, setPicker] = useState<ResolveUrlPickerItem[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function persistMedia(newMediaId: string) {
+    useBoardStore.getState().updateNodeData(rfId, {
+      mediaId: newMediaId,
+      // A real upload replaces any link-only URL.
+      referenceVideoUrl: undefined,
+      status: "done",
+    });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      patchNode(dbId, {
+        status: "done",
+        data: { mediaId: newMediaId, referenceVideoUrl: null, renderedAt: new Date().toISOString() },
+      }).catch(() => {});
+    }
+  }
+
+  async function uploadOwn(file: File) {
+    setError(null);
+    setUploading(true);
+    try {
+      const projectId = await useGenerationStore.getState().ensureProjectId();
+      if (!projectId) {
+        setError("no project");
+        return;
+      }
+      const dbId = parseInt(rfId, 10);
+      const resp = await uploadVideo(file, projectId, isNaN(dbId) ? undefined : dbId);
+      persistMedia(resp.media_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "upload failed");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function fileNameFromUrl(remote: string) {
+    try {
+      const base = new URL(remote).pathname.split("/").filter(Boolean).pop();
+      return base && base.includes(".") ? base : "link video";
+    } catch {
+      return "link video";
+    }
+  }
+
+  function attachUrl(remote: string) {
+    const name = fileNameFromUrl(remote);
+    useBoardStore.getState().updateNodeData(rfId, {
+      // Link-only: store the URL, no download, no Flow upload yet.
+      referenceVideoUrl: remote,
+      referenceVideoName: name,
+      status: "done",
+    });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      patchNode(dbId, {
+        status: "done",
+        data: {
+          referenceVideoUrl: remote,
+          referenceVideoName: name,
+          renderedAt: new Date().toISOString(),
+        },
+      }).catch(() => {});
+    }
+    setLinkMode(false);
+    setLinkValue("");
+    setPicker([]);
+  }
+
+  function clearLink() {
+    useBoardStore.getState().updateNodeData(rfId, {
+      referenceVideoUrl: undefined,
+      referenceVideoName: undefined,
+      status: "idle",
+    });
+    const dbId = parseInt(rfId, 10);
+    if (!isNaN(dbId)) {
+      patchNode(dbId, {
+        status: "idle",
+        data: { referenceVideoUrl: null, referenceVideoName: null },
+      }).catch(() => {});
+    }
+  }
+
+  async function resolveFromLink(url: string) {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    setError(null);
+    setPicker([]);
+    setResolving(true);
+    try {
+      const resolved = await resolveVideoUrl(trimmed);
+      if (resolved.mode === "picker") {
+        if (resolved.items.length === 1) {
+          attachUrl(resolved.items[0].url);
+        } else {
+          setPicker(resolved.items);
+        }
+        return;
+      }
+      attachUrl(resolved.url);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "link resolve failed");
+    } finally {
+      setResolving(false);
+    }
+  }
+
+  function onPick() {
+    fileInputRef.current?.click();
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    const f = e.dataTransfer.files?.[0];
+    if (f) uploadOwn(f);
+  }
+
+  function onDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!dragOver) setDragOver(true);
+  }
+
+  function onDragLeave(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  }
+
+  const hiddenFileInput = (
+    <input
+      ref={fileInputRef}
+      type="file"
+      accept="video/mp4,video/webm,video/quicktime"
+      style={{ display: "none" }}
+      onChange={(e) => {
+        const f = e.target.files?.[0];
+        if (f) uploadOwn(f);
+        e.target.value = "";
+      }}
+    />
+  );
+
+  if (mediaId) {
+    return (
+      <div
+        className="node-body node-body--visual-asset"
+        onDrop={onDrop}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+      >
+        <div className="visual-asset__media">
+          <video
+            className="video-reference__preview"
+            src={mediaUrl(mediaId)}
+            controls
+            muted
+            preload="metadata"
+          />
+        </div>
+        <button
+          type="button"
+          className="visual-asset__action"
+          onClick={onPick}
+          disabled={uploading}
+        >
+          {uploading ? "Uploading…" : "Ganti video"}
+        </button>
+        {hiddenFileInput}
+        {error && <p className="visual-asset__error">{error}</p>}
+      </div>
+    );
+  }
+
+  if (remoteUrl) {
+    return (
+      <div
+        className="node-body node-body--visual-asset"
+        onDrop={onDrop}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+      >
+        <div className="visual-asset__media">
+          <video
+            className="video-reference__preview"
+            src={remoteUrl}
+            controls
+            muted
+            preload="metadata"
+          />
+        </div>
+        <p className="visual-asset__hint" title={remoteUrl}>
+          🔗 {data.referenceVideoName ?? "link video"} — tanpa unduh, diunggah ke Flow saat Generate
+        </p>
+        <button
+          type="button"
+          className="visual-asset__action"
+          onClick={onPick}
+          disabled={uploading}
+        >
+          {uploading ? "Uploading…" : "Ganti video"}
+        </button>
+        <button
+          type="button"
+          className="visual-asset__action"
+          onClick={clearLink}
+          disabled={uploading}
+        >
+          Lepas link
+        </button>
+        {hiddenFileInput}
+        {error && <p className="visual-asset__error">{error}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="node-body node-body--visual-asset"
+      onDrop={onDrop}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+    >
+      <div
+        className={`visual-asset__empty${isProcessing ? " visual-asset__empty--processing" : ""}`}
+      >
+        {isProcessing ? (
+          <span className="visual-asset__hint">Uploading…</span>
+        ) : dragOver ? (
+          <span className="visual-asset__hint">Drop video</span>
+        ) : linkMode ? (
+          <div className="visual-asset__link-row">
+            <input
+              type="url"
+              className="visual-asset__link-input"
+              placeholder="https://… (mp4 / TikTok / YouTube / IG)"
+              value={linkValue}
+              onChange={(e) => setLinkValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") resolveFromLink(linkValue);
+                if (e.key === "Escape") {
+                  setLinkMode(false);
+                  setLinkValue("");
+                  setPicker([]);
+                  setError(null);
+                }
+              }}
+              disabled={resolving}
+              autoFocus
+            />
+            <button
+              type="button"
+              className="visual-asset__action"
+              onClick={() => resolveFromLink(linkValue)}
+              disabled={resolving || !linkValue.trim()}
+            >
+              {resolving ? "Resolving…" : "Save"}
+            </button>
+            <button
+              type="button"
+              className="visual-asset__action"
+              onClick={() => {
+                setLinkMode(false);
+                setLinkValue("");
+                setPicker([]);
+                setError(null);
+              }}
+              disabled={resolving}
+            >
+              ×
+            </button>
+          </div>
+        ) : picker.length > 0 ? (
+          <div className="visual-asset__link-row visual-asset__link-row--column">
+            <span className="visual-asset__hint">Pilih salah satu video:</span>
+            {picker.map((item, i) => (
+              <button
+                key={`${item.url}-${i}`}
+                type="button"
+                className="visual-asset__action"
+                onClick={() => attachUrl(item.url)}
+                title={item.url}
+              >
+                {item.type} #{i + 1}
+              </button>
+            ))}
+            <button
+              type="button"
+              className="visual-asset__action"
+              onClick={() => setPicker([])}
+            >
+              × Batal
+            </button>
+          </div>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="visual-asset__action"
+              onClick={onPick}
+              disabled={uploading}
+            >
+              {uploading ? "Uploading…" : "Upload video"}
+            </button>
+            <button
+              type="button"
+              className="visual-asset__action"
+              onClick={() => {
+                setError(null);
+                setLinkMode(true);
+              }}
+              disabled={uploading}
+            >
+              Add link
+            </button>
+          </>
+        )}
+      </div>
+      {hiddenFileInput}
+      {error && <p className="visual-asset__error">{error}</p>}
     </div>
   );
 }
@@ -1467,19 +1850,25 @@ function NodeBody({ rfId, data }: { rfId: string; data: FlowboardNodeData }) {
       return <EditableTextBody rfId={rfId} data={data} variant="note" />;
     case "visual_asset":
       return <VisualAssetBody rfId={rfId} data={data} />;
+    case "video_reference":
+      return <VideoReferenceBody rfId={rfId} data={data} />;
     case "Storyboard":
       return <StoryboardBody rfId={rfId} data={data} />;
   }
 }
 
 function downloadExt(type: string): string {
-  if (type === "video") return "mp4";
+  if (type === "video" || type === "video_reference") return "mp4";
   return "png";
 }
 
 export function NodeCard(props: NodeProps<FlowNode>) {
   const data = props.data;
   const isNote = data.type === "note";
+  // video_reference is deliberately excluded — it's an upload-only motion
+  // source (wired downstream INTO a video node), never a generation
+  // target itself. Opening the dialog on it would treat it as a video
+  // output with no valid appearance source, which just silently fails.
   const isGenerable = ["image", "prompt", "video", "visual_asset", "character", "Storyboard"].includes(data.type);
   const isRunning = data.status === "running";
   const llmBusy = isLLMBusy(data);

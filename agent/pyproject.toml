@@ -30,3 +30,10 @@ packages = ["flowboard"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.pytest.ini_options]
+# Scope collection to the real suite. Root-level `_*.py` scratch/probe
+# scripts (manual live-Flow debugging helpers) live alongside this file
+# and some match pytest's default `*_test.py` pattern, which made a bare
+# `pytest` crash at collection instead of running the suite.
+testpaths = ["tests"]

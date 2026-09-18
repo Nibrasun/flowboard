@@ -27,6 +27,7 @@ const nodeTypes = {
   prompt: NodeCard,
   note: NodeCard,
   visual_asset: NodeCard,
+  video_reference: NodeCard,
   Storyboard: NodeCard,
 };
 

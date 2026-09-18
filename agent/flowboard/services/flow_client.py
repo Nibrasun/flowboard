@@ -331,11 +331,16 @@ class FlowClient:
         body: Any = None,
         captcha_action: Optional[str] = None,
         timeout: Optional[float] = None,
+        body_b64: Optional[str] = None,
     ) -> dict:
         """Proxy an HTTP call against aisandbox-pa.googleapis.com through the
         extension's browser session. If ``captcha_action`` is set, the
         extension solves reCAPTCHA on an active Flow tab before firing the
         fetch and injects the token into the body's recaptchaContext fields.
+
+        ``body_b64`` forwards raw bytes (base64) instead of a JSON body —
+        used by the resumable upload-video protocol (labs.google web
+        endpoint) where the chunk must reach the extension unencoded.
         """
         params: dict[str, Any] = {
             "url": url,
@@ -343,6 +348,8 @@ class FlowClient:
             "headers": headers or {},
             "body": body,
         }
+        if body_b64:
+            params["bodyB64"] = body_b64
         if captcha_action:
             params["captchaAction"] = captcha_action
         return await self._send("api_request", params, timeout=timeout)

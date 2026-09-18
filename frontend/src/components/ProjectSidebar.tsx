@@ -280,7 +280,7 @@ export function ProjectSidebar() {
                         onClick={() => switchBoard(b.id)}
                         title={
                           isOrphan
-                            ? `${b.name} — Flow project ${status?.flow_project_id ?? ""} không tồn tại trên Google Flow. Click ⋯ → Rebind to re-link.`
+                            ? `${b.name} — Flow project ${status?.flow_project_id ?? ""} tidak ada di Google Flow. Klik ⋯ → Rebind untuk menautkan ulang.`
                             : b.name
                         }
                       >
@@ -357,9 +357,9 @@ export function ProjectSidebar() {
               Delete project?
             </h2>
             <p className="project-modal__hint">
-              <strong>"{deleteTarget.name}"</strong> sẽ bị xoá vĩnh viễn cùng
-              với tất cả nodes, edges, generations, và assets bên trong. Không
-              thể khôi phục.
+              <strong>"{deleteTarget.name}"</strong> akan dihapus permanen
+                            beserta semua nodes, edges, generations, dan assets di dalamnya.
+                            Tidak dapat dipulihkan.
             </p>
             <div className="project-modal__actions">
               <button
@@ -402,7 +402,7 @@ export function ProjectSidebar() {
               New project
             </h2>
             <p className="project-modal__hint">
-              Tên project hiển thị trong sidebar. Có thể đổi sau.
+              Nama project tampil di sidebar. Bisa diubah nanti.
             </p>
             <input
               ref={newDialogInputRef}

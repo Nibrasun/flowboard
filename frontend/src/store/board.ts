@@ -67,7 +67,7 @@ export interface FlowboardNodeData extends Record<string, unknown> {
   // render a visible "busy" treatment that blocks duplicate dispatches.
   autoPromptStatus?: "pending" | "done" | "failed";
   // ISO timestamp persisted when a generation completes successfully.
-  // Powers the "5 phút trước" relative-time display in ResultViewer.
+  // Powers the "5 menit lalu" relative-time display in ResultViewer.
   // Uploads also stamp this so the timestamp reflects "when the asset
   // landed on the node" regardless of source.
   renderedAt?: string;
@@ -79,6 +79,15 @@ export interface FlowboardNodeData extends Record<string, unknown> {
   // plain text in that case so the user knows it's an estimate.
   imageModel?: string;
   videoQuality?: string;
+  // Uploaded reference video (v2v motion source) — set from the
+  // GenerationDialog upload, persisted so the node card badge and a
+  // reopened dialog both see it after reload.
+  referenceVideoMediaId?: string;
+  referenceVideoName?: string;
+  // Link-only reference video (Add-link without download) — a directly
+  // streamable remote URL. Preview plays it as-is; the worker fetches
+  // bytes in-memory and pushes straight to Flow at Generate time.
+  referenceVideoUrl?: string;
   // Character-builder selections — persisted on dispatch so the detail
   // panel can show "Country / Vibe / Gender" pills under METADATA. Keys
   // (`vn`, `clean`, `female`) match the constants in
@@ -134,13 +143,16 @@ function debouncePosition(rfId: string, fn: () => void, delay = 150) {
 }
 
 // ── Type-to-title lookup ───────────────────────────────────────────────────
-const TYPE_TITLE: Record<NodeType, string> = {
+// Exported so callers (e.g. the v2v @-mention prompt builder) can tell a
+// user-renamed node apart from one still sitting on its generic default.
+export const TYPE_TITLE: Record<NodeType, string> = {
   character: "Character",
   image: "Image",
   video: "Video",
   prompt: "Prompt",
   note: "Note",
   visual_asset: "Visual asset",
+  video_reference: "VR",
   Storyboard: "Storyboard",
 };
 
@@ -283,6 +295,9 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          referenceVideoMediaId: n.data["referenceVideoMediaId"] as string | undefined,
+          referenceVideoName: n.data["referenceVideoName"] as string | undefined,
+          referenceVideoUrl: n.data["referenceVideoUrl"] as string | undefined,
         },
       }));
 
@@ -339,6 +354,9 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          referenceVideoMediaId: n.data["referenceVideoMediaId"] as string | undefined,
+          referenceVideoName: n.data["referenceVideoName"] as string | undefined,
+          referenceVideoUrl: n.data["referenceVideoUrl"] as string | undefined,
         },
       }));
       const edges: Edge[] = detail.edges.map(edgeFromDto);
@@ -422,6 +440,9 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
+          referenceVideoMediaId: n.data["referenceVideoMediaId"] as string | undefined,
+          referenceVideoName: n.data["referenceVideoName"] as string | undefined,
+          referenceVideoUrl: n.data["referenceVideoUrl"] as string | undefined,
           error: n.data["error"] as string | undefined,
         },
       }));

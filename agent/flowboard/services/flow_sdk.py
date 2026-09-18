@@ -11,9 +11,11 @@ when the user's paygate tier or model name drifts.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
+import urllib.parse
 import uuid
 from typing import Any, Optional
 
@@ -33,6 +35,43 @@ VIDEO_I2V_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoStartImage"
 VIDEO_OMNI_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoReferenceImages"
 VIDEO_POLL_URL = f"{FLOW_API_BASE}/v1/video:batchCheckAsyncVideoGenerationStatus"
 UPLOAD_IMAGE_URL = f"{FLOW_API_BASE}/v1/flow/uploadImage"
+# Reference-video upload — Flow's web UI does NOT use uploadImage for
+# video (it 400s with INVALID_ARGUMENT). It uses this labs.google
+# resumable endpoint (X-Upload-* protocol, cookie-authenticated web
+# session, no Bearer). Proxied chunk-by-chunk through the extension —
+# Same-origin resumable video upload, reverse-engineered from live Flow UI
+# traffic (Sep 2026): (1) POST {base}/upload/v1/flow/upload/video/{projectId}
+# with X-Goog-Upload-Protocol: resumable + Slug filename opens a session
+# (session URL in x-goog-upload-url response header), (2) POST the session
+# URL with X-Goog-Upload-Command: upload, finalize carries the bytes and
+# returns {mediaId, media, workflow}. Cookie-authenticated (no Bearer).
+UPLOAD_VIDEO_URL_BASE = "https://flow.google.com/upload/v1/flow/upload/video"
+# Server-advertised resumable chunk granularity (x-goog-upload-chunk-granularity).
+UPLOAD_VIDEO_CHUNK_SIZE = 1048576
+_UPLOAD_CHUNK_SIZE = UPLOAD_VIDEO_CHUNK_SIZE
+# Video-to-video motion transfer ("abra_edit"). The chat-agent route
+# (flowCreationAgent:streamChat) was a dead end — it answers a single SSE
+# frame `{"errorEvent":{}}` and never dispatches. Flow's own web UI never
+# calls it: it posts JSPB to the Angular frontend's batchexecute endpoint,
+# same-origin with cookies + an `at` XSRF token lifted from the page.
+# Captured from a live Flow session on 2026-09-06:
+#   rpcid jIps6 → dispatch (returns media_id + workflow_id)
+#   rpcid as29s → workflow detail (carries the signed result video URL)
+# `f.sid` / `bl` query params are optional; only `at` is required.
+FLOW_BATCHEXEC_URL = (
+    "https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute"
+)
+RPC_VIDEO_V2V = "jIps6"
+RPC_WORKFLOW_GET = "as29s"
+V2V_MODEL_KEY = "abra_edit"
+# The extension fills these in on the Flow tab before the request leaves the
+# browser: the XSRF token is page state, the reCAPTCHA token is single-use.
+AT_PLACEHOLDER = "__FLOWBOARD_AT__"
+RECAPTCHA_PLACEHOLDER = "__FLOWBOARD_RECAPTCHA__"
+# Reference-video trim window the UI sends for a 10s job, in frames @24fps.
+# ponytail: fixed 10s window — compute from the requested duration if
+# Flowboard ever exposes v2v durations other than 10s.
+V2V_CLIP_FRAMES = 240
 
 
 # Omni Flash — variable-duration r2v video model. Each duration maps to a
@@ -619,6 +658,122 @@ class FlowSDK:
             out["workflows"] = workflows
         return out
 
+    # ── video-to-video motion transfer (abra_edit, via batchexecute) ──────
+    async def _batchexecute(
+        self,
+        rpcid: str,
+        inner: Any,
+        *,
+        captcha_action: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """POST one JSPB rpc to Flow's Angular frontend and return its
+        decoded payload as ``{data}`` or ``{raw, error}``.
+
+        The body is a form string rather than JSON: the extension relays it
+        from a Flow tab (page origin, cookies) and swaps the two
+        placeholders for the page's XSRF token and a fresh reCAPTCHA token.
+        """
+        f_req = json.dumps([[[rpcid, json.dumps(inner, ensure_ascii=False), None, "generic"]]])
+        body = (
+            "f.req=" + urllib.parse.quote(f_req, safe="")
+            + "&at=" + AT_PLACEHOLDER + "&"
+        )
+        resp = await self._client.api_request(
+            url=f"{FLOW_BATCHEXEC_URL}?rpcids={rpcid}&_reqid={int(time.time() * 1000) % 1_000_000}&rt=c",
+            method="POST",
+            headers={
+                "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "x-same-domain": "1",
+            },
+            body=body,
+            captcha_action=captcha_action,
+            timeout=timeout,
+        )
+        if not isinstance(resp, dict) or resp.get("error"):
+            err = resp.get("error") if isinstance(resp, dict) else "bad_response"
+            return {"raw": resp, "error": err or f"API_{resp.get('status')}"}
+        payload = _extract_batchexec_payload(resp.get("data"), rpcid)
+        if payload is None:
+            return {"raw": resp, "error": f"no_{rpcid}_payload_in_response"}
+        return {"raw": resp, "data": payload}
+
+    async def gen_video_v2v(
+        self,
+        prompt: str,
+        project_id: str,
+        video_media_id: str,
+        image_media_ids: list[str],
+    ) -> dict[str, Any]:
+        """Animate a reference image with the motion/timing of a reference
+        video ("abra_edit"). Single JSPB dispatch (rpcid jIps6) — the shape
+        below mirrors a captured Flow UI request field for field: the video
+        ref carries a frame window, the appearance images appear twice (as
+        prompt mention parts *and* as reference images), and the model key
+        is explicit.
+
+        Returns ``{media_id, workflow_id, raw}`` or ``{error, raw}``.
+        """
+        cleaned_refs = [m for m in (image_media_ids or []) if isinstance(m, str) and m]
+        if not isinstance(video_media_id, str) or not video_media_id:
+            return {"raw": None, "error": "missing_video_media_id"}
+        if not cleaned_refs:
+            return {"raw": None, "error": "missing_image_media_ids"}
+
+        mentions = [[mid, f"{mid}.jpg"] for mid in cleaned_refs]
+        inner = [
+            [[
+                [None, video_media_id, 0, V2V_CLIP_FRAMES],
+                [None, None, [[[None, mentions], [prompt]]]],
+                V2V_MODEL_KEY,
+                1,
+                [None, None, None, None, str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()],
+                None,
+                None,
+                None,
+                [[None, mid] for mid in cleaned_refs],
+            ]],
+            [
+                None, 22, None, None, None, str(project_id),
+                None, None, None, None,
+                [RECAPTCHA_PLACEHOLDER, 1],
+            ],
+            [str(uuid.uuid4()).upper(), 2],
+        ]
+        resp = await self._batchexecute(
+            RPC_VIDEO_V2V, inner, captcha_action=CAPTCHA_VIDEO, timeout=120.0
+        )
+        if resp.get("error"):
+            return resp
+        try:
+            job = resp["data"][2][0]
+            media_id = job[0]
+            workflow_id = job[3][4]
+        except (KeyError, IndexError, TypeError):
+            return {"raw": resp.get("raw"), "error": "no_job_in_dispatch_response"}
+        if not isinstance(media_id, str) or not isinstance(workflow_id, str):
+            return {"raw": resp.get("raw"), "error": "no_job_in_dispatch_response"}
+        return {"raw": resp.get("raw"), "media_id": media_id, "workflow_id": workflow_id}
+
+    async def check_v2v_status(self, workflow_id: str, media_id: str) -> dict[str, Any]:
+        """Poll a gen_video_v2v job by workflow id (rpcid as29s).
+
+        The workflow payload carries the signed result URL once the job
+        finishes; until then it holds only status codes whose enum Google
+        doesn't document, so "done" means "a video URL showed up".
+        """
+        resp = await self._batchexecute(RPC_WORKFLOW_GET, [str(workflow_id)])
+        if resp.get("error"):
+            return {"raw": resp.get("raw"), "error": resp["error"], "done": False}
+        url = _extract_flow_content_video_url(resp.get("data"))
+        if url is None:
+            return {"raw": resp.get("raw"), "done": False, "media_entries": []}
+        return {
+            "raw": resp.get("raw"),
+            "done": True,
+            "media_entries": [{"media_id": media_id, "url": url, "kind": "video"}],
+        }
+
     async def check_async(
         self,
         operation_names: list[str],
@@ -997,6 +1152,105 @@ class FlowSDK:
             return {"raw": resp, "error": "no_media_id_in_upload_response"}
         return {"raw": resp, "media_id": media_id}
 
+    # ── reference-video upload (resumable upload-video, via extension) ────
+    async def upload_video(
+        self,
+        video_bytes: bytes,
+        mime_type: str,
+        project_id: str,
+        file_name: str = "ref.mp4",
+    ) -> dict[str, Any]:
+        """Upload a reference video clip for v2v motion transfer.
+
+        Flow's ``uploadImage`` rejects video bytes (400 INVALID_ARGUMENT),
+        so video goes through Flow's same-origin resumable upload instead:
+        (1) ``POST /upload/v1/flow/upload/video/{projectId}`` with
+        ``X-Goog-Upload-Protocol: resumable`` + ``Slug`` filename opens a
+        session (URL in the ``x-goog-upload-url`` response header),
+        (2) ``POST`` the session URL with ``X-Goog-Upload-Command:
+        upload, finalize`` + raw bytes returns ``{mediaId, media,
+        workflow}``. Every hop is proxied through the extension's
+        cookie-authenticated session (``credentials: include``, no
+        Bearer) — the extension must allow ``flow.google.com/upload/*``.
+
+        Returns ``{raw, media_id}`` or ``{raw, error, stage}`` — ``stage``
+        names the failing hop (``start`` | ``upload`` | ``finalize``) so a
+        protocol mismatch can be iterated without guessing.
+        """
+        import base64 as _b64
+
+        total = len(video_bytes)
+        open_url = f"{UPLOAD_VIDEO_URL_BASE}/{project_id}"
+        # 1) open session -------------------------------------------------
+        # Custom X-Goog-* headers go out verbatim: the extension relays
+        # flow.google.com/upload/* through the page-origin content script
+        # (same-origin fetch, no CORS preflight).
+        _start_headers = {
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(total),
+            "Slug": file_name,
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        }
+        start_resp = await self._client.api_request(
+            url=open_url,
+            method="POST",
+            headers=_start_headers,
+            body=None,
+            timeout=60.0,
+        )
+        if not isinstance(start_resp, dict) or start_resp.get("error"):
+            return {
+                "raw": start_resp,
+                "stage": "start",
+                "error": (start_resp.get("error") if isinstance(start_resp, dict) else None)
+                or f"API_{start_resp.get('status')}" if isinstance(start_resp, dict) else "bad_start_response",
+            }
+        session_url = _extract_upload_session_url(start_resp)
+        if session_url is None:
+            logger.error("upload_video: no session URL in start response — raw=%r", start_resp)
+            return {"raw": start_resp, "stage": "start", "error": "no_session_url"}
+        # A start response may already carry the finished media handle
+        # (small-file fast path) — take it and skip the chunk dance.
+        fast_media = _extract_video_media_id(start_resp)
+        if fast_media:
+            return {"raw": start_resp, "media_id": fast_media}
+
+        # 2) upload bytes in 1MB chunks (server chunk granularity is
+        # 1048576; single-shot finalize of bigger bodies 500s). All but
+        # the last chunk use command "upload"; the last finalizes.
+        up_resp: dict[str, Any] = {}
+        offset = 0
+        while offset < total:
+            piece = video_bytes[offset:offset + _UPLOAD_CHUNK_SIZE]
+            last = offset + len(piece) >= total
+            chunk_b64 = _b64.b64encode(piece).decode("ascii")
+            up_resp = await self._client.api_request(
+                url=session_url,
+                method="POST",
+                headers={
+                    "X-Goog-Upload-Command": "upload, finalize" if last else "upload",
+                    "X-Goog-Upload-Offset": str(offset),
+                    "Slug": file_name,
+                    "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+                },
+                body_b64=chunk_b64,
+                timeout=300.0,
+            )
+            if not isinstance(up_resp, dict) or up_resp.get("error"):
+                return {
+                    "raw": up_resp,
+                    "stage": "upload",
+                    "error": (up_resp.get("error") if isinstance(up_resp, dict) else None)
+                    or "bad_upload_response",
+                }
+            offset += len(piece)
+        media_id = _extract_video_media_id(up_resp)
+        if media_id is None:
+            logger.error("upload_video: no media_id after upload — raw=%r", up_resp)
+            return {"raw": up_resp, "stage": "finalize", "error": "no_media_id_after_upload"}
+        return {"raw": up_resp, "media_id": media_id}
+
 
 def _extract_project_id(resp: Any) -> Optional[str]:
     """TRPC createProject nests the projectId quite deeply."""
@@ -1023,6 +1277,119 @@ def _extract_uploaded_media_id(resp: Any) -> Optional[str]:
         if isinstance(name, str) and name:
             return name
     return None
+
+
+def _extract_upload_session_url(resp: Any) -> Optional[str]:
+    """Pull the resumable session URL out of an upload-video start reply.
+
+    The extension proxy returns ``{status, data, headers}`` where ``data``
+    is the raw text body and ``headers`` the response headers. Google's
+    resumable protocol hands the session back as one of: an
+    ``x-goog-upload-url`` / ``location`` response header, or a JSON body
+    field (``uploadUrl`` / ``sessionUrl`` / ``url``). Accept any of them.
+    """
+    if not isinstance(resp, dict):
+        return None
+    headers = resp.get("headers") or {}
+    if isinstance(headers, dict):
+        lowered = {str(k).lower(): v for k, v in headers.items()}
+        for key in ("x-goog-upload-url", "x-goog-uploadurl", "location"):
+            url = lowered.get(key)
+            if isinstance(url, str) and url.startswith("http"):
+                return url
+    data = resp.get("data")
+    text = data if isinstance(data, str) else None
+    if text:
+        try:
+            body = json.loads(text)
+        except (ValueError, TypeError):
+            body = None
+        if isinstance(body, dict):
+            for key in ("uploadUrl", "sessionUrl", "url", "upload_url", "session_url"):
+                url = body.get(key)
+                if isinstance(url, str) and url.startswith("http"):
+                    return url
+    return None
+
+
+def _extract_video_media_id(resp: Any) -> Optional[str]:
+    """Pull a media handle out of an upload-video reply.
+
+    Accepts the same ``data.media.name`` shape as uploadImage plus the
+    flatter variants the resumable endpoint may return (``mediaId`` /
+    ``name`` at top level of a parsed JSON body).
+    """
+    found = _extract_uploaded_media_id(resp)
+    if found:
+        return found
+    if not isinstance(resp, dict):
+        return None
+    data = resp.get("data")
+    body: Any = None
+    if isinstance(data, dict):
+        body = data
+    elif isinstance(data, str):
+        try:
+            body = json.loads(data)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(body, dict):
+        for key in ("mediaId", "name", "media_id"):
+            val = body.get(key)
+            if isinstance(val, str) and val:
+                return val
+        media = body.get("media")
+        if isinstance(media, dict):
+            for key in ("name", "mediaId", "media_id"):
+                val = media.get(key)
+                if isinstance(val, str) and val:
+                    return val
+    return None
+
+
+_FLOW_VIDEO_URL_RE = re.compile(
+    r"https://flow-content\.google/video/[^\"\\\s]+"
+)
+
+
+def _extract_batchexec_payload(data: Any, rpcid: str) -> Any:
+    """Decode a batchexecute reply into the rpc's own payload.
+
+    The wire format is an anti-JSON-hijack prefix, then length-prefixed
+    lines of ``[["wrb.fr", rpcid, "<json string>", ...], ...]`` envelopes
+    mixed with bookkeeping rows ("di", "af.httprm", "e").
+    """
+    if not isinstance(data, str):
+        return None
+    for line in data.split("\n"):
+        line = line.strip()
+        if not line.startswith("[["):
+            continue
+        try:
+            rows = json.loads(line)
+        except ValueError:
+            continue
+        for row in rows if isinstance(rows, list) else []:
+            if (
+                isinstance(row, list) and len(row) > 2
+                and row[0] == "wrb.fr" and row[1] == rpcid
+                and isinstance(row[2], str)
+            ):
+                try:
+                    return json.loads(row[2])
+                except ValueError:
+                    return None
+    return None
+
+
+def _extract_flow_content_video_url(payload: Any) -> Optional[str]:
+    """Find the signed result-video URL in a workflow payload.
+
+    Positional digging would break on every JSPB field shuffle, and the
+    URL is unambiguous on its own — match it in the serialised payload.
+    """
+    match = _FLOW_VIDEO_URL_RE.search(json.dumps(payload, ensure_ascii=False))
+    return match.group(0) if match else None
 
 
 def extract_operation_names(resp: Any) -> list[str]:
