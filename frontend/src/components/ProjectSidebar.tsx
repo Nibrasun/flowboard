@@ -264,8 +264,8 @@ export function ProjectSidebar() {
           {flowListing && !flowListing.available && (
             <div className="project-sidebar__sync-note">
               {flowListing.pinned_project_id
-                ? "Mọi board generate vào Flow project đã ghim. Đổi ở Settings → Google Flow project."
-                : "Chưa ghim Flow project nào — generate sẽ lỗi. Mở Settings → Google Flow project và dán uuid."}
+                ? "Semua board generate ke Flow project yang di-pin. Ubah di Settings → Google Flow project."
+                : "Belum ada Flow project yang di-pin — generate akan gagal. Buka Settings → Google Flow project dan tempel uuid."}
             </div>
           )}
           {syncError && (
