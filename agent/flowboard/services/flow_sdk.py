@@ -586,7 +586,7 @@ class FlowSDK:
         try:
             payload = await self._payload(
                 RPC_VIDEO_V2V, fb.build_envelope(RPC_VIDEO_V2V, inner),
-                fb.CAPTCHA_VIDEO, timeout=120.0,
+                fb.CAPTCHA_VIDEO, timeout=300.0,
             )
         except Exception as exc:  # broad by design: reported, never swallowed
             return _batch_failure(exc)
@@ -913,7 +913,7 @@ class FlowSDK:
                 resolution=resolution, aspect=aspect_ratio,
             )
             payload = await self._payload(
-                fb.RPC_GEN_VIDEO_REFERENCES, freq, fb.CAPTCHA_VIDEO, timeout=120.0
+                fb.RPC_GEN_VIDEO_REFERENCES, freq, fb.CAPTCHA_VIDEO, timeout=300.0
             )
             operation = fb.read_operation(payload)
         except Exception as exc:  # broad by design: reported, never swallowed

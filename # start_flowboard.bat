@@ -7,7 +7,7 @@ echo ================================
 echo.
 
 :: Jalankan backend di background (tanpa window)
-start /b "" cmd /c "cd /d "D:\Application\Google Flow\flowboard\agent" && call .venv\Scripts\activate && uvicorn flowboard.main:app --reload --port 8101 --timeout-graceful-shutdown 2"
+start /b "" cmd /c "cd /d "D:\Application\Google Flow\flowboard\agent" && call .venv\Scripts\activate && uvicorn flowboard.main:app --reload --port 8434 --timeout-graceful-shutdown 2"
 
 :: Tunggu sebentar
 timeout /t 3 /nobreak >nul
