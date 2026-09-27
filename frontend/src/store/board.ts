@@ -316,17 +316,10 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
-<<<<<<< HEAD
           referenceVideoMediaId: n.data["referenceVideoMediaId"] as string | undefined,
           referenceVideoName: n.data["referenceVideoName"] as string | undefined,
           referenceVideoUrl: n.data["referenceVideoUrl"] as string | undefined,
-=======
-          // The worker persists the partial-failure summary onto the
-          // node now, so a cold load has to read it back — otherwise a
-          // batch where some variants were blocked reloads looking
-          // clean. refreshBoardState already mapped it; these two did not.
           error: n.data["error"] as string | undefined,
->>>>>>> 379174d0981bafad2eadbe8da248c8836bec1ab7
         },
       }));
 
@@ -392,17 +385,10 @@ export const useBoardStore = create<BoardState>((set, get) => ({
           charVibe: n.data["charVibe"] as string | undefined,
           charGender: n.data["charGender"] as string | undefined,
           storyboardGrid: n.data["storyboardGrid"] as StoryboardGrid | undefined,
-<<<<<<< HEAD
           referenceVideoMediaId: n.data["referenceVideoMediaId"] as string | undefined,
           referenceVideoName: n.data["referenceVideoName"] as string | undefined,
           referenceVideoUrl: n.data["referenceVideoUrl"] as string | undefined,
-=======
-          // The worker persists the partial-failure summary onto the
-          // node now, so a cold load has to read it back — otherwise a
-          // batch where some variants were blocked reloads looking
-          // clean. refreshBoardState already mapped it; these two did not.
           error: n.data["error"] as string | undefined,
->>>>>>> 379174d0981bafad2eadbe8da248c8836bec1ab7
         },
       }));
       const edges: Edge[] = detail.edges.map(edgeFromDto);
