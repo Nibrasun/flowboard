@@ -1,0 +1,15 @@
+D:\Application\Google Flow\flowboard\docs\assets\canvas-overview.png
+D:\Application\Google Flow\flowboard\docs\assets\character-model.jpg
+D:\Application\Google Flow\flowboard\docs\assets\composition-autumn.jpg
+D:\Application\Google Flow\flowboard\docs\assets\composition-base.jpg
+D:\Application\Google Flow\flowboard\docs\assets\composition-myeongdong.jpg
+D:\Application\Google Flow\flowboard\docs\assets\composition-seoul-street.jpg
+D:\Application\Google Flow\flowboard\docs\assets\flowboard-intro.gif
+D:\Application\Google Flow\flowboard\docs\assets\logo-wordmark.svg
+D:\Application\Google Flow\flowboard\docs\assets\logo.png
+D:\Application\Google Flow\flowboard\docs\assets\sponsor-qr-binance.png
+D:\Application\Google Flow\flowboard\docs\assets\sponsor-qr-vn.jpg
+D:\Application\Google Flow\flowboard\docs\assets\video-autumn.gif
+D:\Application\Google Flow\flowboard\docs\assets\video-base.gif
+D:\Application\Google Flow\flowboard\docs\assets\video-seoul.gif
+D:\Application\Google Flow\flowboard\docs\assets\visual-asset-tshirt.webp

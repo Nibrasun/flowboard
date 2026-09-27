@@ -27,11 +27,14 @@ function humanizeBackendError(token: string): string | null {
     );
   }
   if (t.includes("no_flow_project")) {
+    // This is what a user with nothing pinned sees on their first failed
+    // generation — the exact moment to name the field that fixes it, rather
+    // than the .env-and-restart workflow that no longer has to be used.
     return (
       "Flow no longer lets Flowboard create projects — that endpoint went "
-      + "with Google's September 2026 migration. Create one project in the "
-      + "Flow UI, copy its uuid from the address bar, and set "
-      + "FLOWBOARD_FLOW_PROJECT_ID to it before restarting the agent."
+      + "with Google's September 2026 migration. Open a project at "
+      + "flow.google.com, copy its address, and paste it into Settings → "
+      + "Google Flow project."
     );
   }
   if (t.includes("unsupported_on_batch_api")) {
@@ -462,6 +465,55 @@ export function getRequest(id: number) {
   return api<RequestDTO>(`/api/requests/${id}`);
 }
 
+/**
+ * One row of `GET /api/boards/{id}/requests`. Deliberately thinner than
+ * `RequestDTO` — no `result` / `error`, because the caller is about to poll
+ * each row anyway and shipping every finished result would make a board
+ * load carry its whole generation history.
+ *
+ * `params` IS included: a page that reloaded mid-generation has to rebuild
+ * the poll's options (prompt, aspect ratio) from it, since the
+ * `dispatchGeneration` call that originally held them died with the old page.
+ */
+export interface BoardRequestItem {
+  id: number;
+  type: string;
+  status: RequestDTO["status"];
+  node_id: number | null;
+  node_short_id: string | null;
+  created_at: string;
+  params: Record<string, unknown>;
+}
+
+/** The two families of in-flight request a reloading board can pick up.
+ * They need different handling, so the caller names the ones it can
+ * actually act on rather than filtering after the fact:
+ * - `worker`: media-producing generations, driven by `attachPoll`.
+ * - `sidecar`: the synchronous LLM activities (vision / auto-prompt),
+ *   whose result is text and which `attachSidecarPoll` handles.
+ * Backend rejects anything else — see `REQUEST_KINDS` in routes/boards.py. */
+export type BoardRequestKind = "worker" | "sidecar";
+
+/** Requests attached to this board's nodes. `active` narrows to the ones
+ * still in flight (queued / running) — what a reloading board wants —
+ * and `kinds` says which of those the caller can handle. Omitting
+ * `kinds` gets `worker` only, which is the safe default: handing a
+ * sidecar row to the generation poll is what wiped nodes' images. */
+export function listBoardRequests(
+  boardId: number,
+  opts?: { active?: boolean; kinds?: BoardRequestKind[] },
+) {
+  const params = new URLSearchParams();
+  if (opts?.active) params.set("active", "true");
+  if (opts?.kinds && opts.kinds.length > 0) {
+    params.set("kinds", opts.kinds.join(","));
+  }
+  const qs = params.toString();
+  return api<{ items: BoardRequestItem[] }>(
+    `/api/boards/${boardId}/requests${qs ? `?${qs}` : ""}`,
+  );
+}
+
 // ── Plans + Pipeline runs ────────────────────────────────────────────────────
 
 export interface PipelineRunDTO {
@@ -607,11 +659,19 @@ export async function autoPrompt(
   return res.json() as Promise<AutoPromptResponse>;
 }
 
-export async function describeMedia(mediaId: string): Promise<VisionDescribeResponse> {
+/** `nodeId` is optional on the wire but should always be passed from the
+ * board: it is what lets the backend write `aiBrief` onto the node itself
+ * (agent/flowboard/services/vision.py), so the brief survives a reload
+ * that kills this promise, and it is what puts the activity row on a
+ * board so `listBoardRequests` can find it again. */
+export async function describeMedia(
+  mediaId: string,
+  nodeId?: number,
+): Promise<VisionDescribeResponse> {
   const res = await fetch("/api/vision/describe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ media_id: mediaId }),
+    body: JSON.stringify({ media_id: mediaId, node_id: nodeId }),
   });
   if (!res.ok) {
     throw new Error(await extractErrorMessage(res));
@@ -680,8 +740,11 @@ export async function uploadImageFromUrl(
 
 
 // ── LLM provider Settings ─────────────────────────────────────────────────
-// See .omc/plans/multi-llm-provider-legacy.md → UI Specification → Frontend ↔
-// backend contract for the full shape.
+// Per-feature model: each of the 3 features (auto_prompt / vision /
+// planner) independently pins a provider + model + effort. The old
+// single-provider invariant ("all 3 features must point at the same
+// name") is gone — `configured` now only means every feature has a
+// provider pinned; model/effort stay optional.
 
 export type LLMProviderName = "claude" | "gemini" | "openai";
 export type LLMFeature = "auto_prompt" | "vision" | "planner";
@@ -693,6 +756,13 @@ export type LLMLastError =
   | "unreachable"
   | "unknown";
 
+/** One entry of a provider's model catalog. `id` is what travels back
+ * in the config / test payloads; `label` is display-only. */
+export interface LLMModelInfo {
+  id: string;
+  label: string;
+}
+
 export interface LLMProviderInfo {
   name: LLMProviderName;
   supportsVision: boolean;
@@ -700,21 +770,45 @@ export interface LLMProviderInfo {
   configured: boolean;
   requiresKey: boolean;
   mode: LLMProviderMode;
+  // Effort vocabularies differ per provider (claude: low…max, agy:
+  // low/medium/high, codex: whatever it reports), so the UI must render
+  // the options from `efforts` and never hardcode a list.
+  supportsEffort: boolean;
+  efforts: string[];
+  // Legitimately [] when the catalog couldn't be fetched (offline, CLI
+  // mid-upgrade, auth expired). The UI falls back to a free-text model
+  // field in that case so a stale catalog can't block the user.
+  models: LLMModelInfo[];
+  defaultModel: string | null;
   lastError?: LLMLastError;
   lastTest?: { ok: boolean; latencyMs?: number; error?: string };
 }
 
+/** One feature's pin. Every field is independently nullable:
+ * `provider` null = feature not set up yet; `model` / `effort` null =
+ * "whatever the provider defaults to". */
+export interface LLMFeatureConfig {
+  provider: LLMProviderName | null;
+  model: string | null;
+  effort: string | null;
+}
+
 export interface LLMConfig {
-  // null when the user hasn't picked a provider for this feature yet.
-  // Backend no longer fabricates a default; the forced-setup gate uses
-  // `configured` (below) to keep the dialog open until the user chooses.
-  auto_prompt: LLMProviderName | null;
-  vision: LLMProviderName | null;
-  planner: LLMProviderName | null;
-  // True only when all 3 features are pinned at the same provider —
-  // the single-provider UI invariant. Drives the forced-setup dialog.
+  auto_prompt: LLMFeatureConfig;
+  vision: LLMFeatureConfig;
+  planner: LLMFeatureConfig;
+  // True once every feature has a provider. Drives the forced-setup
+  // gate. A feature with a provider but no model still counts as
+  // configured — the backend falls back to that provider's default.
   configured: boolean;
 }
+
+/** PUT body — feature keys and the fields inside them are all
+ * optional, so a caller can patch one feature without re-sending the
+ * other two. */
+export type LLMConfigUpdate = Partial<
+  Record<LLMFeature, Partial<LLMFeatureConfig>>
+>;
 
 export async function getLlmProviders(): Promise<LLMProviderInfo[]> {
   // Backend returns snake-case keys mapped from Python — but the route
@@ -725,6 +819,27 @@ export async function getLlmProviders(): Promise<LLMProviderInfo[]> {
   return res.json() as Promise<LLMProviderInfo[]>;
 }
 
+export interface LlmModelCatalog {
+  models: LLMModelInfo[];
+  /** True when the backend answered from its catalog cache rather than
+   * re-asking the CLI — surfaced so the refresh button can tell the
+   * user whether anything was actually re-fetched. */
+  cached: boolean;
+}
+
+export async function getLlmProviderModels(
+  name: LLMProviderName,
+  force = false,
+): Promise<LlmModelCatalog> {
+  // `force=true` bypasses the backend's catalog cache. Wired to the
+  // per-row refresh button for the case where the user installs a new
+  // model / upgrades the CLI while the dialog is open.
+  const qs = force ? "?force=true" : "";
+  const res = await fetch(`/api/llm/providers/${name}/models${qs}`);
+  if (!res.ok) throw new Error(`getLlmProviderModels: ${res.status}`);
+  return res.json() as Promise<LlmModelCatalog>;
+}
+
 export async function getLlmConfig(): Promise<LLMConfig> {
   const res = await fetch("/api/llm/config");
   if (!res.ok) throw new Error(`getLlmConfig: ${res.status}`);
@@ -732,7 +847,7 @@ export async function getLlmConfig(): Promise<LLMConfig> {
 }
 
 export async function setLlmConfig(
-  partial: Partial<LLMConfig>,
+  partial: LLMConfigUpdate,
 ): Promise<{ ok: boolean }> {
   const res = await fetch("/api/llm/config", {
     method: "PUT",
@@ -766,11 +881,23 @@ export interface LlmTestResult {
 
 export async function testLlmProvider(
   name: LLMProviderName,
+  opts: { model?: string | null; effort?: string | null } = {},
 ): Promise<LlmTestResult> {
   // Cost-bounded by the backend: 1-token ping, 15s deadline. Returns
   // ok:false (NOT a non-200 HTTP status) on any failure mode so the
   // UI can render the error inline without try/catch boilerplate.
-  const res = await fetch(`/api/llm/providers/${name}/test`, { method: "POST" });
+  //
+  // model/effort are passed through so a per-feature row tests the
+  // exact combination it is about to save — a provider that answers on
+  // its default model can still fail on an exotic one.
+  const body: { model?: string; effort?: string } = {};
+  if (opts.model) body.model = opts.model;
+  if (opts.effort) body.effort = opts.effort;
+  const res = await fetch(`/api/llm/providers/${name}/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
   if (!res.ok) {
     return { ok: false, error: `HTTP ${res.status}` };
   }
@@ -1028,6 +1155,76 @@ export function getFlowSyncStatus(): Promise<SyncStatusResponse> {
   return api<SyncStatusResponse>("/api/flow/projects");
 }
 
-export function syncBoardsUpToFlow(): Promise<SyncUpResponse> {
-  return api<SyncUpResponse>("/api/flow/projects/sync-up", { method: "POST" });
+export async function syncBoardsUpToFlow(): Promise<SyncUpResponse> {
+  const res = await fetch("/api/flow/projects/sync-up", { method: "POST" });
+  if (!res.ok) {
+    // The refusal body is {message, reason, fix, pinned_project_id}. `api()`
+    // drops it entirely and extractErrorMessage keeps only `message` — but
+    // `fix` is the half that says what to do about it, so join the two.
+    const detail = await res
+      .json()
+      .then((b) => (b as { detail?: unknown } | null)?.detail)
+      .catch(() => null);
+    const d = (detail ?? {}) as { message?: unknown; fix?: unknown };
+    const parts = [d.message, d.fix].filter(
+      (p): p is string => typeof p === "string" && p.length > 0,
+    );
+    throw new Error(
+      parts.length > 0 ? parts.join(" ") : `${res.status} ${res.statusText}`,
+    );
+  }
+  return res.json() as Promise<SyncUpResponse>;
+}
+
+// ── Pinned Flow project ───────────────────────────────────────────────────
+// The single Flow project every board generates into. Flow dropped project
+// creation and listing in the September 2026 migration, so this uuid is the
+// only thing standing between a fresh install and "no project" on every
+// dispatch. Server state — deliberately NOT mirrored into the persisted
+// settings store.
+
+/** Where the effective id comes from. `"override"` = saved from Settings
+ * (wins), `"env"` = FLOWBOARD_FLOW_PROJECT_ID, `"none"` = nothing anywhere,
+ * which is the state where generation cannot work at all. */
+export type PinnedProjectSource = "override" | "env" | "none";
+
+export interface PinnedFlowProject {
+  /** The effective id. null when `source` is `"none"`. */
+  flow_project_id: string | null;
+  source: PinnedProjectSource;
+  /** What .env pins, shown so the user can see what clearing falls back to. */
+  env_project_id: string | null;
+}
+
+export interface PinnedFlowProjectUpdate extends PinnedFlowProject {
+  /** Existing boards re-pointed at the new project by this write. */
+  rebound_boards: number;
+}
+
+export function getPinnedFlowProject(): Promise<PinnedFlowProject> {
+  return api<PinnedFlowProject>("/api/flow/projects/pinned");
+}
+
+/** `null` clears the override and falls back to .env. */
+export async function setPinnedFlowProject(
+  flowProjectId: string | null,
+): Promise<PinnedFlowProjectUpdate> {
+  const res = await fetch("/api/flow/projects/pinned", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ flow_project_id: flowProjectId }),
+  });
+  if (!res.ok) {
+    // The 400 `detail` already names exactly what is wrong with the uuid the
+    // user typed, so it goes through verbatim — humanizeBackendError() would
+    // only risk swapping an actionable sentence for a generic one.
+    const body = await res.json().catch(() => null);
+    const detail = (body as { detail?: unknown } | null)?.detail;
+    throw new Error(
+      typeof detail === "string" && detail
+        ? detail
+        : `${res.status} ${res.statusText}`,
+    );
+  }
+  return res.json() as Promise<PinnedFlowProjectUpdate>;
 }
